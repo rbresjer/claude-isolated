@@ -1,0 +1,19 @@
+# Secrets / local config — the env file holds GH_TOKEN and must never be
+# committed. It normally lives at ~/.config/claude-isolated/env, but ignore any
+# copy placed in the repo too.
+env
+*.env
+.env
+secrets
+*.pat
+*.token
+
+# Local persistent sandbox state, if anyone points $STATE_DIR here.
+.claude-isolated/
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/

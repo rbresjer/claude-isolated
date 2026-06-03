@@ -1,0 +1,46 @@
+# Egress allowlist for the claude-isolated sandbox proxy (squid dstdomain).
+#
+# One destination per line. A leading dot (".npmjs.org") matches that domain
+# AND all its subdomains (apex included); a bare host ("pypi.org") matches
+# exactly. Lines starting with '#' and blank lines are ignored.
+#
+# IMPORTANT: squid rejects the whole config if an entry overlaps another (e.g.
+# listing both 'github.com' and '.github.com', or '.foo.com' and 'a.foo.com').
+# Use ONE broad ".domain" per site rather than the apex plus each subdomain.
+#
+# This is the ONLY way out of the sandbox — edit to taste, but remember every
+# host you add is a potential exfiltration channel for a hijacked agent. Keep it
+# tight. After editing, rebuild the image (it's COPYed in) or remount it.
+
+# --- Anthropic: model API + Claude remote control + telemetry endpoint -------
+.anthropic.com
+.claude.ai
+
+# --- npm / pnpm registry -----------------------------------------------------
+.npmjs.org
+.npmjs.com
+
+# --- PyPI --------------------------------------------------------------------
+pypi.org
+.pythonhosted.org
+
+# --- GitHub (clone/fetch/push over HTTPS, gh CLI, release/raw assets) --------
+# .github.com covers github.com, api.github.com, codeload.github.com, etc.
+.github.com
+.githubusercontent.com
+
+# --- Playwright browser download CDN ----------------------------------------
+.playwright.azureedge.net
+.playwright.dev
+playwright.download.prss.microsoft.com
+
+# --- context7 MCP (live docs) ------------------------------------------------
+.context7.com
+.upstash.io
+
+# --- Common documentation hosts (trim/extend as you like) --------------------
+.readthedocs.io
+developer.mozilla.org
+docs.python.org
+pkg.go.dev
+.nodejs.org

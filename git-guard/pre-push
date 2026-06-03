@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# pre-push guard for the claude-isolated sandbox.
+#
+# Rejects pushes that update refs/heads/main or refs/heads/master and allows
+# everything else (notably feat/* branches). This is a CONVENIENCE guard only:
+# a malicious agent runs as the same user and could edit or bypass it. The real
+# guarantee that main stays safe is SERVER-SIDE branch protection on GitHub.
+#
+# git feeds us one line per ref being pushed on stdin:
+#   <local ref> <local sha> <remote ref> <remote sha>
+set -euo pipefail
+
+blocked=0
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+    case "$remote_ref" in
+        refs/heads/main|refs/heads/master)
+            echo "pre-push: refusing to push to protected branch '${remote_ref#refs/heads/}'." >&2
+            echo "pre-push: push a feat/* branch and open a PR instead." >&2
+            blocked=1
+            ;;
+    esac
+done
+
+exit "$blocked"
