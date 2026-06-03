@@ -46,9 +46,16 @@ pointed at an in-container squid on `127.0.0.1:3128`. iptables sets `OUTPUT` to
 default-DROP and only lets the `proxy` uid reach the network (DNS + 80/443).
 So the agent's packets to anything but loopback are dropped, and the only real
 egress is squid's — which forwards **only** to hostnames in `allowlist.txt`
-(`dstdomain` match) and denies everything else. It **fails closed**: if squid
-isn't up, the entrypoint refuses to start the agent, so there's never a window
-with network but no filter.
+(`dstdomain` match) and denies everything else. It **fails closed** at two
+gates: first the entrypoint refuses to start unless squid is accepting
+connections, then — as the agent uid itself — it actively probes the egress
+posture and aborts on any security-relevant surprise. The probe runs three
+checks: a direct connection bypassing the proxy **must** be dropped (tests the
+iptables rule), a proxied request to a non-allowlisted host **must** be denied
+by squid (tests deny-all), and a proxied request to an allowlisted host should
+succeed (a soft warning, since a stale allowlist surfaces as a loud Claude error
+anyway). So there's never a window with network but no filter, and a botched
+firewall or proxy config launches nothing instead of silently opening the box.
 
 **Capabilities.** The container drops all Linux capabilities except three the
 **root** entrypoint needs transiently: `NET_ADMIN` (program iptables) and
@@ -69,7 +76,7 @@ copied from, never written. See [Config isolation & persistence](#config-isolati
 | `Dockerfile` | arm64 image: squid, Python, gh, Playwright/Chromium, Claude Code, non-root `agent` (uid 1000) |
 | `squid.conf` | filtering forward proxy — allow allowlisted `dstdomain`, deny all |
 | `allowlist.txt` | **editable** curated egress allowlist (one `.domain` per line) |
-| `entrypoint.sh` | root phase (start proxy + program iptables) → agent phase (assemble `~/.claude`, git/gh, run Claude) |
+| `entrypoint.sh` | root phase (start proxy + program iptables) → agent phase (verify egress posture, assemble `~/.claude`, git/gh, run Claude) |
 | `git-guard/pre-push` | rejects pushes to `main`/`master` (convenience; real guard is branch protection) |
 | `claude-isolated` | host wrapper — a plain `docker run`, one ephemeral container per session |
 

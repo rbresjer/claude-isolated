@@ -96,6 +96,45 @@ fi
 # Phase 2: agent (uid 1000, no NET_ADMIN). Configure tooling and run Claude.
 # ---------------------------------------------------------------------------
 
+# --- Verify the egress posture before handing control to the agent ------------
+# Phase 1 only confirmed squid is *up*; it never confirmed the firewall actually
+# *contains* the agent. Probe the real principal (uid 1000) now, same fail-closed
+# stance as the proxy-startup wait. Two HARD checks (a breach launches nothing)
+# and one SOFT check (a broken allowlist is a loud functional error, not an
+# escape, and surfaces immediately as a Claude failure):
+#
+#   1. HARD — a connection that BYPASSES the proxy must not reach the network.
+#      Uses a literal IP over plain HTTP so it tests the iptables OUTPUT drop and
+#      not DNS or TLS: a DROP just times out (curl fails), while an open firewall
+#      cleanly connects to 1.1.1.1:80 and curl exits 0. (HTTPS would muddy this —
+#      a failed cert check also exits non-zero, masking a real breach.)
+#   2. HARD — a request THROUGH the proxy to a non-allowlisted host must be denied
+#      by squid (403), proving deny-all is in force, not merely that squid is up.
+#      squid rejects on the dstdomain ACL before any DNS, so this works offline.
+#   3. SOFT — a request through the proxy to an allowlisted host should succeed;
+#      failure usually means the network is down or the allowlist is too tight, so
+#      warn rather than abort.
+echo "[entrypoint] verifying egress posture (agent uid=$(id -u))"
+
+if curl --noproxy '*' --silent --connect-timeout 5 --output /dev/null \
+        http://1.1.1.1 2>/dev/null; then
+    echo "[entrypoint] FATAL: agent reached the network directly, bypassing the proxy (firewall breach) — refusing to start" >&2
+    exit 1
+fi
+
+if curl --silent --connect-timeout 5 --output /dev/null \
+        https://example.com 2>/dev/null; then
+    echo "[entrypoint] FATAL: proxy forwarded a non-allowlisted host (squid is not denying) — refusing to start" >&2
+    exit 1
+fi
+
+if curl --silent --connect-timeout 5 --max-time 10 --output /dev/null \
+        https://api.github.com/zen 2>/dev/null; then
+    echo "[entrypoint] egress posture OK — direct blocked, proxy denies non-allowlisted, allowlist reachable"
+else
+    echo "[entrypoint] WARNING: an allowlisted host was unreachable through the proxy — network down or allowlist too tight?" >&2
+fi
+
 # --- Assemble ~/.claude from a read-only seed + a writable state dir ----------
 # Isolation model: your real host config is mounted READ-ONLY at /seed and is
 # only ever copied FROM — the agent can never write back to it, so it cannot

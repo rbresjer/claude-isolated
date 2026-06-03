@@ -46,9 +46,23 @@ changing one without understanding the others can silently open the sandbox.
 squid, waits for it to accept connections (**fails closed** — refuses to launch
 the agent if the proxy never comes up), programs the iptables egress firewall,
 then `runuser`s to the `agent` user and re-execs itself. Phase 2 runs as **agent**
-(uid 1000): assembles `~/.claude`, configures git/gh, and execs Claude. Capabilities
+(uid 1000): **verifies the egress posture** (a second fail-closed gate — see
+below), assembles `~/.claude`, configures git/gh, and execs Claude. Capabilities
 (`NET_ADMIN`, `SETUID`, `SETGID`) are granted only to root in phase 1 and vanish on
 the uid change — the agent process holds none.
+
+**Egress self-test** (the second fail-closed gate, phase 2). The proxy-up wait
+proves squid is *running*; it does not prove the firewall *contains* the agent.
+So before launching Claude, phase 2 probes egress as the agent uid and **refuses
+to start** on a breach. Three checks: (1) HARD — a direct connection bypassing
+the proxy must be dropped; it uses a literal IP over plain HTTP (`http://1.1.1.1`,
+`--noproxy '*'`) so it tests the iptables `OUTPUT` drop and not DNS/TLS — HTTPS
+would mask a breach because a failed cert check also exits non-zero. (2) HARD — a
+proxied request to a non-allowlisted host (`example.com`) must be denied by squid.
+(3) SOFT — a proxied request to an allowlisted host (`api.github.com/zen`) should
+succeed; failure only warns, since a stale allowlist or down network surfaces as
+a loud Claude error rather than an escape. A firewall or squid misconfig thus
+launches nothing instead of silently opening the box.
 
 **Egress chokepoint.** Two independent layers, both must agree:
 1. iptables (`OUTPUT` default-DROP) lets *only the `proxy` uid* reach the network
