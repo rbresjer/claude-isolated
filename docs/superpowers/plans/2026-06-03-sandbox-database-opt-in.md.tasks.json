@@ -4,7 +4,8 @@
     {
       "id": 5,
       "subject": "Task 1: Bake a dormant Postgres 16 into the image",
-      "status": "pending",
+      "status": "in_progress",
+      "resumeNote": "Dockerfile changes committed (a9d0d1b) and look correct, BUT verification is incomplete: the image was hand-patched via `docker commit` (disk-space failure mid-build), so the FINAL Dockerfile has never passed a clean `docker build`. ON RESUME: (1) free disk space first with `docker system prune -af --volumes` (user-approved aggressive prune; disk was at 97%/1.1GB free), (2) run a clean `docker build -t claude-sandbox:latest /data/dev/claude-docker` to actually verify, (3) then run the Task 1 spec + code-quality reviews. Minor deviation to note in code review: implementer added /etc/profile.d/postgresql.sh in addition to the ENV PATH (defensible — verify uses a login shell — but redundant with the absolute paths Task 3 uses).",
       "description": "**Goal:** Image contains Postgres 16 server + client on the agent's PATH, default privileged cluster removed, version set by a build-arg.\n\n**Files:** Modify `Dockerfile` (OS-packages ~14-37; runtime env ~88-94).\n\n**Acceptance Criteria:** docker build succeeds; initdb/pg_ctl/psql on PATH; default cluster gone; version via POSTGRES_VERSION build-arg.\n\n**Verify:** `docker build -t claude-sandbox:latest /data/dev/claude-docker` then run agent shell asserting the three binaries resolve and `NO-DEFAULT-CLUSTER` prints.\n\n```json:metadata\n{\"files\": [\"Dockerfile\"], \"verifyCommand\": \"docker build + docker run agent which initdb pg_ctl psql; assert no /etc/postgresql/16/main\", \"acceptanceCriteria\": [\"build succeeds\", \"binaries on PATH\", \"default cluster removed\", \"POSTGRES_VERSION build-arg\"]}\n```"
     },
     {
@@ -28,5 +29,5 @@
       "description": "**Goal:** README gains a generic 'Project databases' section (schema, defaults, persistence/concurrency, placeholder template); CLAUDE.md gains a sandbox-editor note. No project-specific content.\n\n**Files:** Modify `README.md` (section + Contents anchor); Modify `CLAUDE.md` (interlock note).\n\n**Acceptance Criteria:** README documents schema/defaults/persistence/concurrency/localhost access + placeholder template + gitignore reminder + Contents anchor; CLAUDE.md explains Dockerfile/wrapper/entrypoint interlock; no project-specific names.\n\n**Verify:** grep 'Project databases' in README; grep 'claude-isolated.json' in README and CLAUDE.md.\n\n```json:metadata\n{\"files\": [\"README.md\", \"CLAUDE.md\"], \"verifyCommand\": \"grep 'Project databases' README.md; grep 'claude-isolated.json' README.md CLAUDE.md\", \"acceptanceCriteria\": [\"README schema/defaults/persistence/concurrency/localhost\", \"placeholder template + gitignore note\", \"Contents anchor\", \"CLAUDE.md interlock\", \"no project-specific names\"]}\n```"
     }
   ],
-  "lastUpdated": "2026-06-03"
+  "lastUpdated": "2026-06-03T20:40:00Z"
 }
