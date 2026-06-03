@@ -108,6 +108,28 @@ if [ -d /state ]; then
     ln -sfn /state/history.jsonl "$CLAUDE_HOME/history.jsonl"
 fi
 
+# --- Graft host login markers into the sandbox's .claude.json ------------------
+# The copied .credentials.json above is enough for non-interactive (`-p`) auth,
+# but INTERACTIVE Claude decides whether to show the "how do you want to log in?"
+# onboarding screen from markers in ~/.claude.json (hasCompletedOnboarding,
+# oauthAccount, userID, ...). Those live in the host's ~/.claude.json, which we
+# deliberately DON'T copy wholesale (it's large and full of host project history).
+# So we graft ONLY the login/onboarding keys from the read-only seed into the
+# sandbox's own (host-separate) .claude.json — just enough for Claude to use the
+# seeded credentials silently instead of prompting. Seed values win so a host
+# re-login propagates. Written in place (the file is bind-mounted: no mv/rename,
+# which would detach the mount) and computed into a var first to avoid truncating
+# the file before jq has read it.
+CLAUDE_JSON="$(dirname "$CLAUDE_HOME")/.claude.json"
+if [ -f /seed/.claude.json ] && command -v jq >/dev/null 2>&1; then
+    [ -s "$CLAUDE_JSON" ] || echo '{}' > "$CLAUDE_JSON"
+    markers="$(jq '{hasCompletedOnboarding, lastOnboardingVersion, oauthAccount, userID, firstStartTime, theme} | with_entries(select(.value != null))' /seed/.claude.json 2>/dev/null || echo '{}')"
+    if merged="$(jq --argjson m "$markers" '. * $m' "$CLAUDE_JSON" 2>/dev/null)"; then
+        printf '%s\n' "$merged" > "$CLAUDE_JSON"
+        echo "[entrypoint] grafted host login markers into ~/.claude.json (no interactive auth prompt)"
+    fi
+fi
+
 # Treat the bind-mounted workspace as trusted (it's owned by uid 1000 anyway).
 git config --global --add safe.directory /workspace
 git config --global --add safe.directory '*'
