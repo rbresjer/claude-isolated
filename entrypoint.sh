@@ -55,11 +55,37 @@ if [ "$(id -u)" -eq 0 ]; then
     iptables -A OUTPUT -m owner --uid-owner "$proxy_uid" -p tcp --dport 80  -j ACCEPT
     iptables -A OUTPUT -m owner --uid-owner "$proxy_uid" -p tcp --dport 443 -j ACCEPT
 
+    # Inbound dev-server ports (opt-in, set by the wrapper's CLAUDE_ISOLATED_PORTS).
+    # Docker DNATs the host's Tailscale port to this container; the packet arrives
+    # here as a NEW inbound connection, so without an explicit ACCEPT the
+    # default-DROP INPUT policy below would silently swallow it.
+    for dev_port in ${SANDBOX_PORTS:-}; do
+        case "$dev_port" in ''|*[!0-9]*) continue ;; esac
+        iptables -A INPUT -p tcp --dport "$dev_port" -j ACCEPT
+        echo "[entrypoint] allowing inbound dev-server port ${dev_port}/tcp"
+    done
+
     # Default-deny everything else, inbound and out.
     iptables -P INPUT   DROP
     iptables -P FORWARD DROP
     iptables -P OUTPUT  DROP
     echo "[entrypoint] firewall active — agent has no path out except the proxy"
+
+    # --- Make host-absolute config paths resolve inside the container ----------
+    # Your real ~/.claude lives at $HOST_CLAUDE_DIR on the host (e.g. /data/.claude),
+    # and config copied from it bakes that absolute path in: settings.json hook
+    # commands ("python3 /data/.claude/hooks/x.py") and the plugin marketplace
+    # manifests (installLocation). Inside the container ~/.claude is
+    # /home/agent/.claude, so those paths would dangle. Symlink the host path to
+    # the agent's real config dir so every baked-in reference resolves — this also
+    # covers the plugin manifests, which live under the read-only /seed symlink and
+    # so can't be rewritten in place. Done as root (the agent can't mkdir at /);
+    # the target is assembled in phase 2, and a not-yet-existing target is fine.
+    if [ -n "${HOST_CLAUDE_DIR:-}" ] && [ "$HOST_CLAUDE_DIR" != /home/agent/.claude ]; then
+        mkdir -p "$(dirname "$HOST_CLAUDE_DIR")"
+        ln -sfn /home/agent/.claude "$HOST_CLAUDE_DIR"
+        echo "[entrypoint] linked ${HOST_CLAUDE_DIR} -> /home/agent/.claude (host config paths resolve)"
+    fi
 
     # Drop privileges to the agent user and re-run this script as phase 2.
     # NET_ADMIN and root are left behind here; the agent never holds them.
