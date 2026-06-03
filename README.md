@@ -202,6 +202,12 @@ Your real `~/.claude` is mounted **read-only** (as `/seed`) and only ever copied
   **persist across runs** and are shared between sandbox sessions, but are kept
   entirely apart from your real `~/.claude`. Inspect or wipe that dir freely;
   it's created automatically on first run.
+- **Login markers** (`hasCompletedOnboarding`, `oauthAccount`, `userID`, …) —
+  grafted from the host's `~/.claude.json` into the sandbox's own `.claude.json`
+  at startup, so interactive Claude recognizes the seeded credentials and skips
+  the "how do you want to log in?" onboarding screen. Only these few keys are
+  copied — **not** the host's full `.claude.json` (which is large and holds your
+  host project history). A host re-login propagates on the next sandbox run.
 
 What does **not** persist: changes to global config (settings / hooks /
 `CLAUDE.md` / plugins) — by design, since those are the host-escape vectors.

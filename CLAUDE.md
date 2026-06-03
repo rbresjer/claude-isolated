@@ -73,6 +73,18 @@ host dir mounted at `/state`. The entrypoint reconstructs `~/.claude` from `/see
 keeps bulk/state/read-only paths out of the throwaway copy — keep it in sync if
 you change what persists.
 
+`.credentials.json` is *not* on the skip-list, so host credentials are copied in
+and `-p` (print-mode) auth works directly. **Interactive** auth additionally
+needs login markers (`hasCompletedOnboarding`, `oauthAccount`, `userID`) that
+live in the host's `~/.claude.json` — which *is* on the skip-list. The entrypoint
+therefore grafts *only those keys* (via `jq '. * $m'`, seed wins) from
+`/seed/.claude.json` into the sandbox's own bind-mounted `.claude.json`; it does
+not copy the whole file (large, holds host project history). Write it **in place**
+(the file is bind-mounted — a `mv`/rename would detach the mount), and compute the
+merge into a variable before redirecting, or you truncate the file before `jq`
+reads it. (Gotcha found the hard way: `"${var:-{}}"` as a jq `--argjson` default
+appends a stray `}` and corrupts the JSON — pass a pre-validated var instead.)
+
 ## Editing rules that bite
 
 - **Allowlist overlaps are fatal.** squid refuses to start if an entry overlaps
