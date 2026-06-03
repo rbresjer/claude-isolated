@@ -15,6 +15,7 @@
 # --- Anthropic: model API + Claude remote control + telemetry endpoint -------
 .anthropic.com
 .claude.ai
+.claude.com
 
 # --- npm / pnpm registry -----------------------------------------------------
 .npmjs.org
