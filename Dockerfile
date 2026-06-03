@@ -75,15 +75,22 @@ RUN chmod 0755 /usr/local/bin/entrypoint.sh /etc/claude-isolated/git-hooks/pre-p
 
 # --- Runtime env -------------------------------------------------------------
 # Force all agent HTTP(S) through the in-container proxy; exempt loopback so the
-# proxy hop itself and local dev servers aren't re-proxied. Kill telemetry and
-# the autoupdater so the allowlist can stay tight.
+# proxy hop itself and local dev servers aren't re-proxied.
+#
+# We deliberately DON'T set CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC (or its
+# DISABLE_TELEMETRY component): that umbrella var also disables feature-flag
+# evaluation (GrowthBook/Statsig), and Remote Control is gated behind the
+# tengu_ccr_bridge feature flag. In current Claude Code the feature-flag service
+# shares a kill switch with telemetry, so keeping Remote Control working means
+# letting that traffic through. It only targets .anthropic.com, which the
+# allowlist already permits. Only the autoupdater is suppressed — it's pointless
+# in a version-pinned image and an in-container update wouldn't persist anyway.
 ENV HTTP_PROXY=http://127.0.0.1:3128 \
     HTTPS_PROXY=http://127.0.0.1:3128 \
     http_proxy=http://127.0.0.1:3128 \
     https_proxy=http://127.0.0.1:3128 \
     NO_PROXY=localhost,127.0.0.1,::1 \
     no_proxy=localhost,127.0.0.1,::1 \
-    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
     DISABLE_AUTOUPDATER=1
 
 WORKDIR /workspace
