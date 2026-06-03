@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# Container entrypoint for the claude-isolated sandbox. Two phases:
+#
+#   1. root  — start the filtering proxy and program the egress firewall, then
+#              drop to the unprivileged 'agent' user (uid 1000).
+#   2. agent — configure git/gh, install the push guard, and exec Claude Code
+#              with --dangerously-skip-permissions. The sandbox is the guard.
+set -euo pipefail
+
+PROXY_PORT=3128
+
+# ---------------------------------------------------------------------------
+# Phase 1: root. Bring up egress controls, then re-exec ourselves as 'agent'.
+# ---------------------------------------------------------------------------
+if [ "$(id -u)" -eq 0 ]; then
+    proxy_uid="$(id -u proxy)"
+
+    echo "[entrypoint] starting filtering proxy (squid) on 127.0.0.1:${PROXY_PORT}"
+    # squid daemonizes; its worker runs as the 'proxy' user, the only uid the
+    # firewall below lets reach the network.
+    squid -f /etc/squid/squid.conf
+
+    echo "[entrypoint] waiting for proxy to accept connections"
+    ready=0
+    for _ in $(seq 1 100); do
+        if (exec 3<>"/dev/tcp/127.0.0.1/${PROXY_PORT}") 2>/dev/null; then
+            exec 3>&- 2>/dev/null || true
+            ready=1
+            break
+        fi
+        sleep 0.1
+    done
+    if [ "$ready" -ne 1 ]; then
+        echo "[entrypoint] FATAL: proxy did not come up — refusing to start (fail closed)" >&2
+        exit 1
+    fi
+
+    echo "[entrypoint] applying default-deny egress firewall (proxy-uid=${proxy_uid})"
+    # Flush, then build an allow-list of OUTPUT rules and finally flip the
+    # default policy to DROP. The agent (uid 1000) matches none of the ACCEPTs,
+    # so its only reachable destination is loopback (the proxy).
+    iptables -F
+    iptables -X 2>/dev/null || true
+
+    # Loopback: the agent -> proxy hop, and Docker's embedded DNS at 127.0.0.11.
+    iptables -A INPUT  -i lo -j ACCEPT
+    iptables -A OUTPUT -o lo -j ACCEPT
+    # Return traffic for connections we already permitted.
+    iptables -A INPUT  -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    # ONLY the proxy uid may reach the network: DNS (to resolve allowlisted
+    # hosts) and HTTP/HTTPS (to forward allowed requests). Nothing else.
+    iptables -A OUTPUT -m owner --uid-owner "$proxy_uid" -p udp --dport 53  -j ACCEPT
+    iptables -A OUTPUT -m owner --uid-owner "$proxy_uid" -p tcp --dport 53  -j ACCEPT
+    iptables -A OUTPUT -m owner --uid-owner "$proxy_uid" -p tcp --dport 80  -j ACCEPT
+    iptables -A OUTPUT -m owner --uid-owner "$proxy_uid" -p tcp --dport 443 -j ACCEPT
+
+    # Default-deny everything else, inbound and out.
+    iptables -P INPUT   DROP
+    iptables -P FORWARD DROP
+    iptables -P OUTPUT  DROP
+    echo "[entrypoint] firewall active — agent has no path out except the proxy"
+
+    # Drop privileges to the agent user and re-run this script as phase 2.
+    # NET_ADMIN and root are left behind here; the agent never holds them.
+    exec runuser -u agent -- "$0" "$@"
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 2: agent (uid 1000, no NET_ADMIN). Configure tooling and run Claude.
+# ---------------------------------------------------------------------------
+
+# --- Assemble ~/.claude from a read-only seed + a writable state dir ----------
+# Isolation model: your real host config is mounted READ-ONLY at /seed and is
+# only ever copied FROM — the agent can never write back to it, so it cannot
+# plant hooks, settings, plugins, or a malicious .claude.json that would later
+# run in your normal host Claude sessions. The mutable state worth keeping
+# (conversations, project memory, history, the sandbox's own .claude.json) lives
+# in /state, a dedicated host dir SEPARATE from your real ~/.claude. Everything
+# else the box does is thrown away when the container exits.
+CLAUDE_HOME=/home/agent/.claude
+if [ -d /seed ]; then
+    mkdir -p "$CLAUDE_HOME"
+    # Copy small config items out of the seed, skipping bulk/state paths: those
+    # are either huge (projects/), mounted read-only (plugins/), or persisted via
+    # /state. --preserve=mode keeps permission bits (e.g. .credentials.json 600)
+    # without attempting chown, which would fail as a non-root user.
+    for item in /seed/* /seed/.[!.]*; do
+        [ -e "$item" ] || continue
+        case "$(basename "$item")" in
+            projects|plugins|todos|history.jsonl|.claude.json|file-history|backups|cache|paste-cache|shell-snapshots)
+                continue ;;
+        esac
+        cp -r --preserve=mode "$item" "$CLAUDE_HOME/" 2>/dev/null || true
+    done
+    # Plugins: read-only, straight from the host seed (no copy, cannot be altered).
+    ln -sfn /seed/plugins "$CLAUDE_HOME/plugins"
+fi
+
+# Persistent state -> /state (a host dir separate from your real ~/.claude).
+# Directory symlinks are safe for these (files are created inside them); the
+# sandbox's .claude.json is bind-mounted directly at ~/.claude.json by the wrapper.
+if [ -d /state ]; then
+    mkdir -p /state/projects /state/todos
+    [ -e /state/history.jsonl ] || : > /state/history.jsonl
+    ln -sfn /state/projects      "$CLAUDE_HOME/projects"
+    ln -sfn /state/todos         "$CLAUDE_HOME/todos"
+    ln -sfn /state/history.jsonl "$CLAUDE_HOME/history.jsonl"
+fi
+
+# Treat the bind-mounted workspace as trusted (it's owned by uid 1000 anyway).
+git config --global --add safe.directory /workspace
+git config --global --add safe.directory '*'
+
+# Route all git hooks through our guard dir so the pre-push main-block applies
+# regardless of what the repo ships. Best-effort: real protection is server-side.
+git config --global core.hooksPath /etc/claude-isolated/git-hooks
+
+# Give commits an identity. Override via GIT_AUTHOR_NAME / GIT_AUTHOR_EMAIL in
+# the env file (git also reads those two vars directly when making a commit).
+git config --global user.name  "${GIT_AUTHOR_NAME:-claude-isolated}"
+git config --global user.email "${GIT_AUTHOR_EMAIL:-claude-isolated@localhost}"
+git config --global init.defaultBranch main
+
+# Wire git to authenticate to GitHub over HTTPS using the injected PAT, so the
+# agent can fetch/push to allowlisted repos and `gh` works. No token -> no auth
+# configured (the agent can still work on local repos / public clones).
+if [ -n "${GH_TOKEN:-}" ]; then
+    gh auth setup-git 2>/dev/null \
+        && echo "[entrypoint] git configured to auth via GH_TOKEN (gh credential helper)" \
+        || echo "[entrypoint] WARNING: 'gh auth setup-git' failed; pushes may prompt" >&2
+fi
+
+# Default command: a skip-permissions Claude session in the workspace. The
+# proxy + firewall + non-root user are what make that flag safe here.
+if [ "$#" -eq 0 ]; then
+    set -- claude --dangerously-skip-permissions
+fi
+
+exec "$@"

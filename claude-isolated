@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# claude-isolated — launch a sandboxed, skip-permissions Claude Code session for
+# the current directory. Each invocation is a fresh, ephemeral container, so you
+# can run many concurrently (one per tmux pane / project) with no shared state.
+#
+#   Usage:  cd <project> && claude-isolated [claude args...]
+#
+# The container drops all capabilities except three the ROOT entrypoint needs
+# transiently — NET_ADMIN (program iptables), SETUID/SETGID (drop root -> the
+# 'proxy' and 'agent' users). All three are gone the instant root becomes the
+# agent (changing uid clears capabilities), so the agent never holds them.
+#
+# Config isolation: your real ~/.claude is mounted READ-ONLY (as /seed) and only
+# copied from — the sandbox can never modify your host config, so it cannot plant
+# hooks/settings/plugins or a malicious .claude.json that would run in your normal
+# Claude sessions. Conversations and project memory persist to a SEPARATE host
+# dir ($STATE_DIR, default /data/.claude-isolated), never your real ~/.claude.
+# All egress goes through an in-container domain-allowlist proxy. See the README.
+set -euo pipefail
+
+IMAGE="${CLAUDE_ISOLATED_IMAGE:-claude-sandbox:latest}"
+ENVFILE="${CLAUDE_ISOLATED_ENV:-$HOME/.config/claude-isolated/env}"
+CLAUDE_DIR="${CLAUDE_ISOLATED_CLAUDE_DIR:-/data/.claude}"
+# Persistent, host-separate sandbox state (conversations, memory, .claude.json).
+# Defaults to a sibling of your config dir on the same volume.
+STATE_DIR="${CLAUDE_ISOLATED_STATE:-$(dirname "$CLAUDE_DIR")/.claude-isolated}"
+
+die() { echo "claude-isolated: $*" >&2; exit 1; }
+
+# --- Preconditions -----------------------------------------------------------
+command -v docker >/dev/null 2>&1 || die "docker not found on PATH"
+docker image inspect "$IMAGE" >/dev/null 2>&1 \
+    || die "image '$IMAGE' not found — build it first:  docker build -t $IMAGE $(dirname "$0")"
+
+[ -d "$CLAUDE_DIR" ] || die "claude config dir '$CLAUDE_DIR' not found"
+
+# Ensure the env file exists; scaffold a template on first run so --env-file
+# (which requires the file to exist) doesn't error out cryptically.
+if [ ! -f "$ENVFILE" ]; then
+    mkdir -p "$(dirname "$ENVFILE")"
+    cat > "$ENVFILE" <<'TEMPLATE'
+# claude-isolated environment — NOT committed. One VAR=value per line.
+#
+# Fine-grained GitHub PAT, scoped to the repos you want the sandbox to push to
+# (contents:rw + pull_requests:rw). Used by git/gh over HTTPS. Leave blank to
+# work only on local/public repos.
+GH_TOKEN=
+# Commit identity (git also reads these two directly when committing).
+GIT_AUTHOR_NAME=
+GIT_AUTHOR_EMAIL=
+# Optional: pre-issued Claude token if you don't rely on the mounted credentials.
+# CLAUDE_CODE_OAUTH_TOKEN=
+TEMPLATE
+    chmod 600 "$ENVFILE"
+    die "created env template at '$ENVFILE' — fill in GH_TOKEN (and identity), then re-run"
+fi
+
+# Prepare the persistent, host-separate state dir. The sandbox's own .claude.json
+# is bind-mounted as a file (Claude updates it in place), so pre-create it to stop
+# Docker from materializing a root-owned directory in its place.
+mkdir -p "$STATE_DIR"
+[ -e "$STATE_DIR/.claude.json" ] || echo '{}' > "$STATE_DIR/.claude.json"
+[ -f "$STATE_DIR/.claude.json" ] || die "'$STATE_DIR/.claude.json' exists but is not a regular file"
+
+# --- Launch ------------------------------------------------------------------
+# Mounts:
+#   /workspace           rw  — the current project (only host code path exposed)
+#   /seed                ro  — your real ~/.claude; copied from, never written
+#   /state               rw  — sandbox conversations/memory/history, host-separate
+#   /home/agent/.claude.json rw — the sandbox's own .claude.json (not your host's)
+# The entrypoint assembles /home/agent/.claude from /seed + /state at startup.
+exec docker run --rm -it \
+    --cap-drop ALL --cap-add NET_ADMIN --cap-add SETUID --cap-add SETGID \
+    --security-opt no-new-privileges \
+    --pids-limit 512 --memory 4g --cpus "${CLAUDE_ISOLATED_CPUS:-1.5}" \
+    --env-file "$ENVFILE" \
+    -v "$PWD:/workspace" -w /workspace \
+    -v "$CLAUDE_DIR:/seed:ro" \
+    -v "$STATE_DIR:/state" \
+    -v "$STATE_DIR/.claude.json:/home/agent/.claude.json" \
+    "$IMAGE" "$@"
