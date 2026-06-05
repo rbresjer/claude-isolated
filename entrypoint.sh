@@ -24,7 +24,12 @@ if [ "$(id -u)" -eq 0 ]; then
     ready=0
     for _ in $(seq 1 100); do
         if (exec 3<>"/dev/tcp/127.0.0.1/${PROXY_PORT}") 2>/dev/null; then
-            exec 3>&- 2>/dev/null || true
+            # The probe opens fd 3 in a SUBSHELL, so it's already closed in this
+            # shell — nothing to clean up here. (A bare `exec 3>&- 2>/dev/null`
+            # would be an exec-with-no-command and permanently redirect THIS
+            # shell's stderr to /dev/null, silently swallowing every later
+            # message — including phase 2's egress-self-test FATALs and the
+            # agent's own stderr, since this fd state survives the runuser exec.)
             ready=1
             break
         fi
@@ -72,9 +77,9 @@ if [ "$(id -u)" -eq 0 ]; then
     echo "[entrypoint] firewall active — agent has no path out except the proxy"
 
     # --- Make host-absolute config paths resolve inside the container ----------
-    # Your real ~/.claude lives at $HOST_CLAUDE_DIR on the host (e.g. /data/.claude),
+    # Your real ~/.claude lives at $HOST_CLAUDE_DIR on the host (e.g. /home/you/.claude),
     # and config copied from it bakes that absolute path in: settings.json hook
-    # commands ("python3 /data/.claude/hooks/x.py") and the plugin marketplace
+    # commands ("python3 /home/you/.claude/hooks/x.py") and the plugin marketplace
     # manifests (installLocation). Inside the container ~/.claude is
     # /home/agent/.claude, so those paths would dangle. Symlink the host path to
     # the agent's real config dir so every baked-in reference resolves — this also
@@ -217,6 +222,106 @@ if [ -n "${GH_TOKEN:-}" ]; then
         && echo "[entrypoint] git configured to auth via GH_TOKEN (gh credential helper)" \
         || echo "[entrypoint] WARNING: 'gh auth setup-git' failed; pushes may prompt" >&2
 fi
+
+# --- Optional project database (opt-in via /workspace/.claude-isolated.json) --
+# Generic, engine-neutral contract: a "database" object with a "type" selects an
+# engine (only "postgres" implemented). The server is baked into the image but
+# dormant; we start it here only on request. BEST-EFFORT, never fail-closed — a
+# database that won't start is a feature failure (warn loudly, keep going), not a
+# security breach. Bound to 127.0.0.1, run as the agent uid, data persisted under
+# /state keyed per project; none of this touches the egress posture.
+
+start_postgres() {
+    local cfg="$1" user name password port
+    user="$(jq -r '.database.user // "postgres"' "$cfg")"
+    name="$(jq -r --arg u "$user" '.database.name // $u' "$cfg")"
+    password="$(jq -r '.database.password // "postgres"' "$cfg")"
+    port="$(jq -r '.database.port // 5432' "$cfg")"
+
+    # The workspace config is attacker-controllable in this model (the agent can
+    # write it), and user/name are interpolated into SQL as role/database names.
+    # Constrain them to plain SQL identifiers and reject anything else — best-
+    # effort, so a bad value warns and skips rather than aborting phase 2. (The
+    # password is NOT interpolated; it's passed via a psql variable below, which
+    # quotes it safely, so it needs no charset restriction.)
+    local id_re='^[A-Za-z_][A-Za-z0-9_]{0,62}$'
+    if ! [[ "$user" =~ $id_re ]]; then
+        echo "[entrypoint] WARNING: invalid database user '$user' (must match ${id_re}) — skipping database setup" >&2
+        return 0
+    fi
+    if ! [[ "$name" =~ $id_re ]]; then
+        echo "[entrypoint] WARNING: invalid database name '$name' (must match ${id_re}) — skipping database setup" >&2
+        return 0
+    fi
+    case "$port" in
+        ''|*[!0-9]*) echo "[entrypoint] WARNING: invalid database port '$port' — skipping database setup" >&2; return 0 ;;
+    esac
+    if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        echo "[entrypoint] WARNING: database port '$port' out of range — skipping database setup" >&2
+        return 0
+    fi
+
+    local pgbin=/usr/lib/postgresql/16/bin
+    local key="${SANDBOX_PROJECT_KEY:-default}"
+    local pgdata="/state/pg/${key}/16"
+    local logfile="/state/pg/${key}/postgres-16.log"
+    mkdir -p "$pgdata"
+
+    if [ ! -f "$pgdata/PG_VERSION" ]; then
+        echo "[entrypoint] initializing Postgres cluster at $pgdata"
+        if ! "$pgbin/initdb" -D "$pgdata" -U postgres \
+                --auth-local=trust --auth-host=trust >/dev/null 2>&1; then
+            echo "[entrypoint] WARNING: initdb failed — project database unavailable" >&2
+            return 0
+        fi
+        # Loopback only (defense in depth) and a writable socket dir for the agent.
+        {
+            echo "listen_addresses = '127.0.0.1'"
+            echo "unix_socket_directories = '/tmp'"
+        } >> "$pgdata/postgresql.conf"
+    fi
+
+    if ! "$pgbin/pg_ctl" -D "$pgdata" -l "$logfile" -o "-p $port" -w -t 30 start >/dev/null 2>&1; then
+        echo "[entrypoint] WARNING: postgres did not start on port $port (concurrent session of this project? see $logfile) — continuing without a database" >&2
+        return 0
+    fi
+    echo "[entrypoint] postgres listening on 127.0.0.1:${port} (data: $pgdata)"
+
+    # Create the requested role + database (idempotent across persistent restarts).
+    # Identifiers are validated above, so interpolating them as quoted names is
+    # safe. The password is NOT interpolated by the shell: it's passed as a psql
+    # variable and quoted by psql via :'pw'. That interpolation only happens for
+    # SQL read from stdin/-f (NOT from -c), so the CREATE ROLE is piped in — this
+    # is what keeps a password like  x'; DROP ...  inside the literal.
+    local psql_base=("$pgbin/psql" -h 127.0.0.1 -p "$port" -U postgres -d postgres -tA)
+    if [ "$("${psql_base[@]}" -c "SELECT 1 FROM pg_roles WHERE rolname='$user'" 2>/dev/null)" != "1" ]; then
+        printf '%s\n' "CREATE ROLE \"$user\" LOGIN SUPERUSER PASSWORD :'pw'" \
+            | "${psql_base[@]}" -v pw="$password" >/dev/null 2>&1 \
+            && echo "[entrypoint] created role '$user'"
+    fi
+    if [ "$("${psql_base[@]}" -c "SELECT 1 FROM pg_database WHERE datname='$name'" 2>/dev/null)" != "1" ]; then
+        "${psql_base[@]}" -c "CREATE DATABASE \"$name\" OWNER \"$user\"" >/dev/null 2>&1 \
+            && echo "[entrypoint] created database '$name' owned by '$user'"
+    fi
+}
+
+setup_database() {
+    local cfg=/workspace/.claude-isolated.json
+    [ -f "$cfg" ] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    # Require a "database" object; absent or false => nothing to do.
+    [ "$(jq -r 'try ((.database | type) == "object") catch false' "$cfg" 2>/dev/null)" = "true" ] || return 0
+
+    local dbtype
+    dbtype="$(jq -r '.database.type // "postgres"' "$cfg" 2>/dev/null)"
+    case "$dbtype" in
+        postgres) start_postgres "$cfg" ;;
+        *) echo "[entrypoint] WARNING: unsupported database type '$dbtype' in .claude-isolated.json — skipping" >&2 ;;
+    esac
+}
+
+# Guarded so a database hiccup can never abort phase 2 (set -e is active).
+setup_database || true
 
 # Default command: a skip-permissions Claude session in the workspace. The
 # proxy + firewall + non-root user are what make that flag safe here.

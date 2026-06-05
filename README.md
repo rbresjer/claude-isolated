@@ -31,6 +31,7 @@ proxy.
 - [Editing the allowlist (requires rebuild)](#editing-the-allowlist-requires-rebuild)
 - [Rebuilding & updating](#rebuilding--updating)
 - [Config isolation & persistence](#config-isolation--persistence)
+- [Project databases](#project-databases)
 - [Playwright](#playwright)
 - [Environment-variable overrides](#environment-variable-overrides)
 - [Resource limits](#resource-limits)
@@ -92,8 +93,13 @@ copied from, never written. See [Config isolation & persistence](#config-isolati
 
 ## 1. Build the image
 
+Clone the repo and build from its root (the commands below assume you're in the
+repo root):
+
 ```sh
-docker build -t claude-sandbox:latest /data/dev/claude-docker
+git clone https://github.com/rbresjer/claude-isolated.git
+cd claude-isolated
+docker build -t claude-sandbox:latest .
 ```
 
 The Claude Code version is pinned via a build arg (`CLAUDE_CODE_VERSION`,
@@ -104,9 +110,9 @@ default `2.1.161`); override with `--build-arg CLAUDE_CODE_VERSION=X.Y.Z`.
 Put `claude-isolated` on your `PATH` (pick one):
 
 ```sh
-sudo install -m 755 /data/dev/claude-docker/claude-isolated /usr/local/bin/claude-isolated
+sudo install -m 755 ./claude-isolated /usr/local/bin/claude-isolated
 # or, no sudo:
-install -m 755 /data/dev/claude-docker/claude-isolated ~/.local/bin/claude-isolated
+install -m 755 ./claude-isolated ~/.local/bin/claude-isolated
 ```
 
 The installed copy is independent of the source — re-run this after editing
@@ -149,8 +155,8 @@ Persistent state goes to a shared, host-separate dir (see below).
 it and **rebuild the image** (the file is COPYed in at build time):
 
 ```sh
-$EDITOR /data/dev/claude-docker/allowlist.txt
-docker build -t claude-sandbox:latest /data/dev/claude-docker
+$EDITOR allowlist.txt
+docker build -t claude-sandbox:latest .
 ```
 
 Rules and gotchas:
@@ -173,7 +179,7 @@ Rules and gotchas:
 `squid.conf`, `Dockerfile`, `entrypoint.sh`, or `git-guard/pre-push`:
 
 ```sh
-docker build -t claude-sandbox:latest /data/dev/claude-docker
+docker build -t claude-sandbox:latest .
 ```
 
 Layers are cached, so config-only changes (allowlist/squid/entrypoint) rebuild in
@@ -183,13 +189,13 @@ seconds. The next `claude-isolated` invocation uses the new image automatically.
 host-side copy, not part of the image):
 
 ```sh
-sudo install -m 755 /data/dev/claude-docker/claude-isolated /usr/local/bin/claude-isolated
+sudo install -m 755 ./claude-isolated /usr/local/bin/claude-isolated
 ```
 
 **Bump Claude Code:**
 
 ```sh
-docker build -t claude-sandbox:latest --build-arg CLAUDE_CODE_VERSION=X.Y.Z /data/dev/claude-docker
+docker build -t claude-sandbox:latest --build-arg CLAUDE_CODE_VERSION=X.Y.Z .
 ```
 
 ## Config isolation & persistence
@@ -205,7 +211,7 @@ Your real `~/.claude` is mounted **read-only** (as `/seed`) and only ever copied
 - **Plugins** — symlinked **read-only** straight from the host seed (no copy).
 - **Conversations, project memory, command history, the sandbox's own
   `.claude.json`** — live in a **separate** host dir (`$STATE_DIR`, default
-  `/data/.claude-isolated`; override with `CLAUDE_ISOLATED_STATE`). These
+  `~/.claude-isolated`; override with `CLAUDE_ISOLATED_STATE`). These
   **persist across runs** and are shared between sandbox sessions, but are kept
   entirely apart from your real `~/.claude`. Inspect or wipe that dir freely;
   it's created automatically on first run.
@@ -218,6 +224,67 @@ Your real `~/.claude` is mounted **read-only** (as `/seed`) and only ever copied
 
 What does **not** persist: changes to global config (settings / hooks /
 `CLAUDE.md` / plugins) — by design, since those are the host-escape vectors.
+
+## Project databases
+
+Some projects need a database (often run via `docker compose` outside the
+sandbox). Docker isn't available inside the container — and Docker-in-Docker
+would break the isolation model — but a database server is just a process on a
+port, and **loopback traffic inside the container is unrestricted**, so a
+sandbox-managed database needs no change to the egress firewall.
+
+The image ships PostgreSQL 16 **dormant**. A project opts in with a gitignored
+`/workspace/.claude-isolated.json`:
+
+```json
+{
+  "database": {
+    "type": "postgres",
+    "name": "myapp",
+    "user": "myapp",
+    "password": "myapp",
+    "port": 5432
+  }
+}
+```
+
+On launch the entrypoint inits (first run) and starts a loopback-only cluster,
+creating the role and database, so your app's `DATABASE_URL=postgresql://myapp:myapp@localhost:5432/myapp`
+just works. Reach it from inside the sandbox with `psql -h localhost -p 5432`
+(not `docker exec`).
+
+**Fields** (all optional; a `database` object must be present to trigger anything):
+
+| Key        | Default              | Notes                                          |
+|------------|----------------------|------------------------------------------------|
+| `type`     | `postgres`           | engine selector; only `postgres` is implemented (an unknown value warns and is skipped) |
+| `user`     | `postgres`           | created with LOGIN + dev superuser             |
+| `name`     | the resolved `user`  | database name, owned by `user`                 |
+| `password` | `postgres`           | set on the user                                |
+| `port`     | `5432`               | TCP port the server listens on (loopback only) |
+
+**Persistence.** Data persists **per project** under the host-separate `/state`
+dir (keyed to the project path), so you migrate/seed once and it's there next
+launch. Migrations and seeds remain your project's job — run them normally
+against `localhost`.
+
+**Caveats.**
+- Two concurrent sandbox sessions of the *same* project collide on the data dir
+  (the second one's database won't start and logs a warning) — same limitation as
+  the per-project dev-server port lanes.
+- A database that fails to start never aborts the session; it logs a `WARNING`
+  and Claude launches anyway, so you can debug it.
+
+**Gitignore the config file.** Add `.claude-isolated.json` to the project's
+`.gitignore` — it carries local credentials and is sandbox-specific.
+
+**Per-project recipe.** To tell a future agent session how to use this in a given
+project, drop a note in *that project's* `CLAUDE.md`, e.g.:
+
+> This project uses a sandbox-managed Postgres. Create `.claude-isolated.json`
+> with `{"database":{"type":"postgres","name":"<db>","user":"<user>","password":"<pw>","port":<port>}}`
+> matching `DATABASE_URL`, then run the project's migrate + seed scripts. Reach
+> the DB with `psql -h localhost`.
 
 ## Playwright
 
@@ -241,7 +308,7 @@ Set these in your shell before running `claude-isolated`:
 |---|---|---|
 | `CLAUDE_ISOLATED_IMAGE` | `claude-sandbox:latest` | Image to run |
 | `CLAUDE_ISOLATED_ENV` | `~/.config/claude-isolated/env` | env file (`GH_TOKEN`, identity, …) |
-| `CLAUDE_ISOLATED_CLAUDE_DIR` | `/data/.claude` | Host config dir, mounted read-only as the seed |
+| `CLAUDE_ISOLATED_CLAUDE_DIR` | `~/.claude` | Host config dir, mounted read-only as the seed |
 | `CLAUDE_ISOLATED_STATE` | `<dir of config>/.claude-isolated` | Persistent, host-separate state dir |
 | `CLAUDE_ISOLATED_CPUS` | `1.5` | CPU limit per container |
 
@@ -256,7 +323,7 @@ starve the host. The default leaves headroom for several concurrent sessions on 
 
 | Symptom | Cause / fix |
 |---|---|
-| `image '…' not found` | Build it: `docker build -t claude-sandbox:latest /data/dev/claude-docker` |
+| `image '…' not found` | Build it from the repo root: `docker build -t claude-sandbox:latest .` |
 | `created env template … then re-run` | Expected on first run — fill in `~/.config/claude-isolated/env` |
 | A needed download/host fails | Not allowlisted. Add it to `allowlist.txt` and rebuild. Check `docker logs` for the squid deny line. |
 | Container exits immediately, squid `FATAL` about a `dstdomain` | Overlapping allowlist entries (a domain and its subdomain). Collapse to one `.domain`. |

@@ -9,6 +9,9 @@ FROM node:22-bookworm-slim
 # Pin Claude Code for reproducible builds (host runs 2.1.161).
 ARG CLAUDE_CODE_VERSION=2.1.161
 
+# Pin the Postgres major version baked in for project databases (opt-in at runtime).
+ARG POSTGRES_VERSION=16
+
 ENV DEBIAN_FRONTEND=noninteractive
 
 # --- OS packages -------------------------------------------------------------
@@ -34,6 +37,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         jq \
         gh \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- PostgreSQL (server + client), for opt-in per-project databases -----------
+# Installed dormant: the image ships it but the entrypoint only starts a cluster
+# when a project's .claude-isolated.json asks for one. PGDG repo because bookworm
+# defaults to PG 15. The package auto-creates a root/postgres-owned cluster we
+# never use, so drop it. Add the versioned bindir (initdb/pg_ctl live there, not
+# on the default PATH) to the agent PATH via ENV below.
+RUN install -d /usr/share/postgresql-common/pgdg \
+    && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+         -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+    && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
+         > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        "postgresql-${POSTGRES_VERSION}" \
+        "postgresql-client-${POSTGRES_VERSION}" \
+    && pg_dropcluster --stop "${POSTGRES_VERSION}" main 2>/dev/null || true \
+    && echo "export PATH=/usr/lib/postgresql/${POSTGRES_VERSION}/bin:\$PATH" \
+         > /etc/profile.d/postgresql.sh \
     && rm -rf /var/lib/apt/lists/*
 
 # --- pnpm via corepack -------------------------------------------------------
@@ -91,7 +113,8 @@ ENV HTTP_PROXY=http://127.0.0.1:3128 \
     https_proxy=http://127.0.0.1:3128 \
     NO_PROXY=localhost,127.0.0.1,::1 \
     no_proxy=localhost,127.0.0.1,::1 \
-    DISABLE_AUTOUPDATER=1
+    DISABLE_AUTOUPDATER=1 \
+    PATH=/usr/lib/postgresql/16/bin:$PATH
 
 WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

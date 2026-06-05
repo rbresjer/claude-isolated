@@ -14,13 +14,13 @@
 # copied from — the sandbox can never modify your host config, so it cannot plant
 # hooks/settings/plugins or a malicious .claude.json that would run in your normal
 # Claude sessions. Conversations and project memory persist to a SEPARATE host
-# dir ($STATE_DIR, default /data/.claude-isolated), never your real ~/.claude.
+# dir ($STATE_DIR, default ~/.claude-isolated), never your real ~/.claude.
 # All egress goes through an in-container domain-allowlist proxy. See the README.
 set -euo pipefail
 
 IMAGE="${CLAUDE_ISOLATED_IMAGE:-claude-sandbox:latest}"
 ENVFILE="${CLAUDE_ISOLATED_ENV:-$HOME/.config/claude-isolated/env}"
-CLAUDE_DIR="${CLAUDE_ISOLATED_CLAUDE_DIR:-/data/.claude}"
+CLAUDE_DIR="${CLAUDE_ISOLATED_CLAUDE_DIR:-$HOME/.claude}"
 # Persistent, host-separate sandbox state (conversations, memory, .claude.json).
 # Defaults to a sibling of your config dir on the same volume.
 STATE_DIR="${CLAUDE_ISOLATED_STATE:-$(dirname "$CLAUDE_DIR")/.claude-isolated}"
@@ -61,6 +61,17 @@ fi
 mkdir -p "$STATE_DIR"
 [ -e "$STATE_DIR/.claude.json" ] || echo '{}' > "$STATE_DIR/.claude.json"
 [ -f "$STATE_DIR/.claude.json" ] || die "'$STATE_DIR/.claude.json' exists but is not a regular file"
+
+# --- Stable per-project identity ---------------------------------------------
+# The container only ever sees /workspace, so it cannot derive the host project
+# path needed to key per-project persistent state (e.g. a database data dir under
+# /state). Compute a stable key here and pass it in. A sha256 (not the port-lane
+# cksum) because a DB-dir collision would silently mix two projects' data, which
+# is worse than a port clash. Basename prefix is for human readability only.
+project_base="$(basename "$PWD")"
+project_base="${project_base//[!A-Za-z0-9._-]/_}"   # sanitize without piping basename's newline through tr
+project_hash="$(printf '%s' "$PWD" | sha256sum | cut -c1-12)"
+PROJECT_KEY="${project_base}-${project_hash}"
 
 # --- Optional: publish dev-server ports to the Tailscale interface ------------
 # Opt-in via CLAUDE_ISOLATED_PORTS (space/comma list). Each entry is either a
@@ -119,6 +130,7 @@ exec docker run --rm -it \
     --env-file "$ENVFILE" \
     -e "SANDBOX_PORTS=$INPUT_PORTS" \
     -e "HOST_CLAUDE_DIR=$CLAUDE_DIR" \
+    -e "SANDBOX_PROJECT_KEY=$PROJECT_KEY" \
     ${PORT_ARGS[@]+"${PORT_ARGS[@]}"} \
     -v "$PWD:/workspace" -w /workspace \
     -v "$CLAUDE_DIR:/seed:ro" \
