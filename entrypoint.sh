@@ -238,6 +238,29 @@ start_postgres() {
     password="$(jq -r '.database.password // "postgres"' "$cfg")"
     port="$(jq -r '.database.port // 5432' "$cfg")"
 
+    # The workspace config is attacker-controllable in this model (the agent can
+    # write it), and user/name are interpolated into SQL as role/database names.
+    # Constrain them to plain SQL identifiers and reject anything else — best-
+    # effort, so a bad value warns and skips rather than aborting phase 2. (The
+    # password is NOT interpolated; it's passed via a psql variable below, which
+    # quotes it safely, so it needs no charset restriction.)
+    local id_re='^[A-Za-z_][A-Za-z0-9_]{0,62}$'
+    if ! [[ "$user" =~ $id_re ]]; then
+        echo "[entrypoint] WARNING: invalid database user '$user' (must match ${id_re}) — skipping database setup" >&2
+        return 0
+    fi
+    if ! [[ "$name" =~ $id_re ]]; then
+        echo "[entrypoint] WARNING: invalid database name '$name' (must match ${id_re}) — skipping database setup" >&2
+        return 0
+    fi
+    case "$port" in
+        ''|*[!0-9]*) echo "[entrypoint] WARNING: invalid database port '$port' — skipping database setup" >&2; return 0 ;;
+    esac
+    if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        echo "[entrypoint] WARNING: database port '$port' out of range — skipping database setup" >&2
+        return 0
+    fi
+
     local pgbin=/usr/lib/postgresql/16/bin
     local key="${SANDBOX_PROJECT_KEY:-default}"
     local pgdata="/state/pg/${key}/16"
@@ -265,13 +288,19 @@ start_postgres() {
     echo "[entrypoint] postgres listening on 127.0.0.1:${port} (data: $pgdata)"
 
     # Create the requested role + database (idempotent across persistent restarts).
-    local q="$pgbin/psql -h 127.0.0.1 -p $port -U postgres -d postgres -tAc"
-    if [ "$($q "SELECT 1 FROM pg_roles WHERE rolname='$user'" 2>/dev/null)" != "1" ]; then
-        $q "CREATE ROLE \"$user\" LOGIN SUPERUSER PASSWORD '$password'" >/dev/null 2>&1 \
+    # Identifiers are validated above, so interpolating them as quoted names is
+    # safe. The password is NOT interpolated by the shell: it's passed as a psql
+    # variable and quoted by psql via :'pw'. That interpolation only happens for
+    # SQL read from stdin/-f (NOT from -c), so the CREATE ROLE is piped in — this
+    # is what keeps a password like  x'; DROP ...  inside the literal.
+    local psql_base=("$pgbin/psql" -h 127.0.0.1 -p "$port" -U postgres -d postgres -tA)
+    if [ "$("${psql_base[@]}" -c "SELECT 1 FROM pg_roles WHERE rolname='$user'" 2>/dev/null)" != "1" ]; then
+        printf '%s\n' "CREATE ROLE \"$user\" LOGIN SUPERUSER PASSWORD :'pw'" \
+            | "${psql_base[@]}" -v pw="$password" >/dev/null 2>&1 \
             && echo "[entrypoint] created role '$user'"
     fi
-    if [ "$($q "SELECT 1 FROM pg_database WHERE datname='$name'" 2>/dev/null)" != "1" ]; then
-        $q "CREATE DATABASE \"$name\" OWNER \"$user\"" >/dev/null 2>&1 \
+    if [ "$("${psql_base[@]}" -c "SELECT 1 FROM pg_database WHERE datname='$name'" 2>/dev/null)" != "1" ]; then
+        "${psql_base[@]}" -c "CREATE DATABASE \"$name\" OWNER \"$user\"" >/dev/null 2>&1 \
             && echo "[entrypoint] created database '$name' owned by '$user'"
     fi
 }
