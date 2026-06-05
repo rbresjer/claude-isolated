@@ -99,6 +99,28 @@ merge into a variable before redirecting, or you truncate the file before `jq`
 reads it. (Gotcha found the hard way: `"${var:-{}}"` as a jq `--argjson` default
 appends a stray `}` and corrupts the JSON — pass a pre-validated var instead.)
 
+## Project databases (opt-in)
+
+A project can request a sandbox-managed database via a gitignored
+`/workspace/.claude-isolated.json` (`{"database":{"type":"postgres",...}}`). Three
+pieces interlock:
+
+- **Dockerfile** bakes PostgreSQL (server + client) in **dormant** — the
+  `POSTGRES_VERSION` build-arg pins the major; the package's default privileged
+  cluster is dropped; the versioned bindir is added to the agent `PATH`.
+- **`claude-isolated`** exports `SANDBOX_PROJECT_KEY` (a sha256-derived,
+  collision-resistant id for `$PWD`) — the container only sees `/workspace`, so
+  the host must supply the key used to namespace persistent data under `/state`.
+- **`entrypoint.sh`** phase 2 (`setup_database`) parses the config and, for
+  `type=postgres`, inits/starts a **loopback-only** cluster under
+  `/state/pg/<key>/<major>` as the agent uid, creating the role+db. It is
+  **best-effort, never fail-closed**: a DB that won't start warns and continues
+  (the fail-closed gates are for *security*, not features). Because it binds
+  `127.0.0.1` and loopback egress is always allowed, it touches none of the
+  iptables/squid posture. Adding another engine (e.g. MySQL) is a new `case`
+  branch in `setup_database` plus its server package in the Dockerfile — the
+  config contract doesn't change.
+
 ## Editing rules that bite
 
 - **Allowlist overlaps are fatal.** squid refuses to start if an entry overlaps
