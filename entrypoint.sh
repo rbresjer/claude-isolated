@@ -77,9 +77,9 @@ if [ "$(id -u)" -eq 0 ]; then
     echo "[entrypoint] firewall active — agent has no path out except the proxy"
 
     # --- Make host-absolute config paths resolve inside the container ----------
-    # Your real ~/.claude lives at $HOST_CLAUDE_DIR on the host (e.g. /data/.claude),
+    # Your real ~/.claude lives at $HOST_CLAUDE_DIR on the host (e.g. /home/you/.claude),
     # and config copied from it bakes that absolute path in: settings.json hook
-    # commands ("python3 /data/.claude/hooks/x.py") and the plugin marketplace
+    # commands ("python3 /home/you/.claude/hooks/x.py") and the plugin marketplace
     # manifests (installLocation). Inside the container ~/.claude is
     # /home/agent/.claude, so those paths would dangle. Symlink the host path to
     # the agent's real config dir so every baked-in reference resolves — this also

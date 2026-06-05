@@ -19,17 +19,17 @@ The "build" is the Docker image build; there are no unit tests — verification 
 running the sandbox and watching `docker logs` for squid allow/deny lines.
 
 ```sh
-# Build (after editing anything baked into the image)
-docker build -t claude-sandbox:latest /data/dev/claude-docker
+# Build (after editing anything baked into the image; run from the repo root)
+docker build -t claude-sandbox:latest .
 
 # Bump the pinned Claude Code version
-docker build -t claude-sandbox:latest --build-arg CLAUDE_CODE_VERSION=X.Y.Z /data/dev/claude-docker
+docker build -t claude-sandbox:latest --build-arg CLAUDE_CODE_VERSION=X.Y.Z .
 
 # Run a session (cwd becomes /workspace; args pass through to `claude`)
 cd <project> && claude-isolated [claude args...]
 
 # Re-install the host wrapper after editing `claude-isolated` (it is NOT in the image)
-sudo install -m 755 /data/dev/claude-docker/claude-isolated /usr/local/bin/claude-isolated
+sudo install -m 755 ./claude-isolated /usr/local/bin/claude-isolated
 ```
 
 **What requires what:** editing `Dockerfile`, `entrypoint.sh`, `squid.conf`,

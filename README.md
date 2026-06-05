@@ -93,8 +93,13 @@ copied from, never written. See [Config isolation & persistence](#config-isolati
 
 ## 1. Build the image
 
+Clone the repo and build from its root (the commands below assume you're in the
+repo root):
+
 ```sh
-docker build -t claude-sandbox:latest /data/dev/claude-docker
+git clone https://github.com/rbresjer/claude-isolated.git
+cd claude-isolated
+docker build -t claude-sandbox:latest .
 ```
 
 The Claude Code version is pinned via a build arg (`CLAUDE_CODE_VERSION`,
@@ -105,9 +110,9 @@ default `2.1.161`); override with `--build-arg CLAUDE_CODE_VERSION=X.Y.Z`.
 Put `claude-isolated` on your `PATH` (pick one):
 
 ```sh
-sudo install -m 755 /data/dev/claude-docker/claude-isolated /usr/local/bin/claude-isolated
+sudo install -m 755 ./claude-isolated /usr/local/bin/claude-isolated
 # or, no sudo:
-install -m 755 /data/dev/claude-docker/claude-isolated ~/.local/bin/claude-isolated
+install -m 755 ./claude-isolated ~/.local/bin/claude-isolated
 ```
 
 The installed copy is independent of the source — re-run this after editing
@@ -150,8 +155,8 @@ Persistent state goes to a shared, host-separate dir (see below).
 it and **rebuild the image** (the file is COPYed in at build time):
 
 ```sh
-$EDITOR /data/dev/claude-docker/allowlist.txt
-docker build -t claude-sandbox:latest /data/dev/claude-docker
+$EDITOR allowlist.txt
+docker build -t claude-sandbox:latest .
 ```
 
 Rules and gotchas:
@@ -174,7 +179,7 @@ Rules and gotchas:
 `squid.conf`, `Dockerfile`, `entrypoint.sh`, or `git-guard/pre-push`:
 
 ```sh
-docker build -t claude-sandbox:latest /data/dev/claude-docker
+docker build -t claude-sandbox:latest .
 ```
 
 Layers are cached, so config-only changes (allowlist/squid/entrypoint) rebuild in
@@ -184,13 +189,13 @@ seconds. The next `claude-isolated` invocation uses the new image automatically.
 host-side copy, not part of the image):
 
 ```sh
-sudo install -m 755 /data/dev/claude-docker/claude-isolated /usr/local/bin/claude-isolated
+sudo install -m 755 ./claude-isolated /usr/local/bin/claude-isolated
 ```
 
 **Bump Claude Code:**
 
 ```sh
-docker build -t claude-sandbox:latest --build-arg CLAUDE_CODE_VERSION=X.Y.Z /data/dev/claude-docker
+docker build -t claude-sandbox:latest --build-arg CLAUDE_CODE_VERSION=X.Y.Z .
 ```
 
 ## Config isolation & persistence
@@ -206,7 +211,7 @@ Your real `~/.claude` is mounted **read-only** (as `/seed`) and only ever copied
 - **Plugins** — symlinked **read-only** straight from the host seed (no copy).
 - **Conversations, project memory, command history, the sandbox's own
   `.claude.json`** — live in a **separate** host dir (`$STATE_DIR`, default
-  `/data/.claude-isolated`; override with `CLAUDE_ISOLATED_STATE`). These
+  `~/.claude-isolated`; override with `CLAUDE_ISOLATED_STATE`). These
   **persist across runs** and are shared between sandbox sessions, but are kept
   entirely apart from your real `~/.claude`. Inspect or wipe that dir freely;
   it's created automatically on first run.
@@ -303,7 +308,7 @@ Set these in your shell before running `claude-isolated`:
 |---|---|---|
 | `CLAUDE_ISOLATED_IMAGE` | `claude-sandbox:latest` | Image to run |
 | `CLAUDE_ISOLATED_ENV` | `~/.config/claude-isolated/env` | env file (`GH_TOKEN`, identity, …) |
-| `CLAUDE_ISOLATED_CLAUDE_DIR` | `/data/.claude` | Host config dir, mounted read-only as the seed |
+| `CLAUDE_ISOLATED_CLAUDE_DIR` | `~/.claude` | Host config dir, mounted read-only as the seed |
 | `CLAUDE_ISOLATED_STATE` | `<dir of config>/.claude-isolated` | Persistent, host-separate state dir |
 | `CLAUDE_ISOLATED_CPUS` | `1.5` | CPU limit per container |
 
@@ -318,7 +323,7 @@ starve the host. The default leaves headroom for several concurrent sessions on 
 
 | Symptom | Cause / fix |
 |---|---|
-| `image '…' not found` | Build it: `docker build -t claude-sandbox:latest /data/dev/claude-docker` |
+| `image '…' not found` | Build it from the repo root: `docker build -t claude-sandbox:latest .` |
 | `created env template … then re-run` | Expected on first run — fill in `~/.config/claude-isolated/env` |
 | A needed download/host fails | Not allowlisted. Add it to `allowlist.txt` and rebuild. Check `docker logs` for the squid deny line. |
 | Container exits immediately, squid `FATAL` about a `dstdomain` | Overlapping allowlist entries (a domain and its subdomain). Collapse to one `.domain`. |
