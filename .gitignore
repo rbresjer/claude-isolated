@@ -11,6 +11,10 @@ secrets
 # Local persistent sandbox state, if anyone points $STATE_DIR here.
 .claude-isolated/
 
+# Superpowers planning artifacts (plans/specs/task state) — local workflow scratch,
+# not part of the shipped sandbox.
+docs/superpowers/
+
 # OS / editor cruft
 .DS_Store
 *.swp
