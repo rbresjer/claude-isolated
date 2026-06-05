@@ -144,7 +144,7 @@ if [ -f "$CONFIG_FILE" ]; then
     # Container-critical paths a read-only same-path mount must never shadow
     # (mounting one of these, or an ancestor of one, would clobber the sandbox's
     # own filesystem). Subdirectories like /data/... or /home/<you>/proj are fine.
-    protected="/home /etc /usr /bin /sbin /lib /lib64 /var /tmp /root /opt /boot /run /dev /proc /sys /workspace /seed /state"
+    protected="/home /home/agent /etc /usr /bin /sbin /lib /lib64 /var /tmp /root /opt /boot /run /dev /proc /sys /workspace /seed /state"
 
     declare -A seen=()
     while IFS= read -r m; do
