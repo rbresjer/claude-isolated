@@ -2,32 +2,32 @@
   "planPath": "docs/superpowers/plans/2026-06-03-sandbox-database-opt-in.md",
   "tasks": [
     {
-      "id": 5,
+      "id": 1,
       "subject": "Task 1: Bake a dormant Postgres 16 into the image",
-      "status": "in_progress",
+      "status": "completed",
       "resumeNote": "Dockerfile changes committed (a9d0d1b) and look correct, BUT verification is incomplete: the image was hand-patched via `docker commit` (disk-space failure mid-build), so the FINAL Dockerfile has never passed a clean `docker build`. ON RESUME: (1) free disk space first with `docker system prune -af --volumes` (user-approved aggressive prune; disk was at 97%/1.1GB free), (2) run a clean `docker build -t claude-sandbox:latest /data/dev/claude-docker` to actually verify, (3) then run the Task 1 spec + code-quality reviews. Minor deviation to note in code review: implementer added /etc/profile.d/postgresql.sh in addition to the ENV PATH (defensible — verify uses a login shell — but redundant with the absolute paths Task 3 uses).",
       "description": "**Goal:** Image contains Postgres 16 server + client on the agent's PATH, default privileged cluster removed, version set by a build-arg.\n\n**Files:** Modify `Dockerfile` (OS-packages ~14-37; runtime env ~88-94).\n\n**Acceptance Criteria:** docker build succeeds; initdb/pg_ctl/psql on PATH; default cluster gone; version via POSTGRES_VERSION build-arg.\n\n**Verify:** `docker build -t claude-sandbox:latest /data/dev/claude-docker` then run agent shell asserting the three binaries resolve and `NO-DEFAULT-CLUSTER` prints.\n\n```json:metadata\n{\"files\": [\"Dockerfile\"], \"verifyCommand\": \"docker build + docker run agent which initdb pg_ctl psql; assert no /etc/postgresql/16/main\", \"acceptanceCriteria\": [\"build succeeds\", \"binaries on PATH\", \"default cluster removed\", \"POSTGRES_VERSION build-arg\"]}\n```"
     },
     {
-      "id": 6,
+      "id": 2,
       "subject": "Task 2: Pass a stable per-project key from the host wrapper",
-      "status": "pending",
+      "status": "completed",
       "description": "**Goal:** `claude-isolated` exports `SANDBOX_PROJECT_KEY` (stable sha256-based id for $PWD) into the container.\n\n**Files:** Modify `claude-isolated` (after state-dir prep; docker run env).\n\n**Acceptance Criteria:** stable `basename-<12hexsha>`; distinct paths distinct keys, basename sanitized; passed as SANDBOX_PROJECT_KEY.\n\n**Verify:** compute key for a sample path twice, identical `basename-<12 hex>`.\n\n```json:metadata\n{\"files\": [\"claude-isolated\"], \"verifyCommand\": \"compute basename+sha256(12) key for sample path twice, assert stable\", \"acceptanceCriteria\": [\"stable key\", \"distinct paths distinct keys\", \"passed as SANDBOX_PROJECT_KEY\"]}\n```"
     },
     {
-      "id": 7,
+      "id": 3,
       "subject": "Task 3: Init + start the database in the entrypoint",
-      "status": "pending",
-      "blockedBy": [5, 6],
+      "status": "completed",
+      "blockedBy": [1, 2],
       "description": "**Goal:** entrypoint.sh phase 2 reads /workspace/.claude-isolated.json and for type=postgres inits/starts a loopback-only cluster under /state/pg/<key>/16 creating the role+db; best-effort, never aborts.\n\n**Files:** Modify `entrypoint.sh` (add start_postgres/setup_database; call `setup_database || true` before default-command block).\n\n**Acceptance Criteria:** init+listen+create on first run, psql connects; persists on second run; no-config => no action; unsupported type warns+continues; DB failure warns never aborts; binds 127.0.0.1.\n\n**Verify:** build image; docker run entrypoint with a postgres config, assert psql returns `myapp|myapp`; re-run asserts persistence; negative cases for no-config and type=mysql.\n\n```json:metadata\n{\"files\": [\"entrypoint.sh\"], \"verifyCommand\": \"docker build + docker run entrypoint with .claude-isolated.json; assert psql myapp|myapp; re-run persistence; negative no-config + mysql\", \"acceptanceCriteria\": [\"inits/starts/creates role+db, psql connects\", \"persists second run\", \"no config no action\", \"unsupported type warns continues\", \"failure warns never aborts\", \"binds 127.0.0.1\"]}\n```"
     },
     {
-      "id": 8,
+      "id": 4,
       "subject": "Task 4: Document the feature (generic only)",
-      "status": "pending",
-      "blockedBy": [7],
+      "status": "completed",
+      "blockedBy": [3],
       "description": "**Goal:** README gains a generic 'Project databases' section (schema, defaults, persistence/concurrency, placeholder template); CLAUDE.md gains a sandbox-editor note. No project-specific content.\n\n**Files:** Modify `README.md` (section + Contents anchor); Modify `CLAUDE.md` (interlock note).\n\n**Acceptance Criteria:** README documents schema/defaults/persistence/concurrency/localhost access + placeholder template + gitignore reminder + Contents anchor; CLAUDE.md explains Dockerfile/wrapper/entrypoint interlock; no project-specific names.\n\n**Verify:** grep 'Project databases' in README; grep 'claude-isolated.json' in README and CLAUDE.md.\n\n```json:metadata\n{\"files\": [\"README.md\", \"CLAUDE.md\"], \"verifyCommand\": \"grep 'Project databases' README.md; grep 'claude-isolated.json' README.md CLAUDE.md\", \"acceptanceCriteria\": [\"README schema/defaults/persistence/concurrency/localhost\", \"placeholder template + gitignore note\", \"Contents anchor\", \"CLAUDE.md interlock\", \"no project-specific names\"]}\n```"
     }
   ],
-  "lastUpdated": "2026-06-03T20:40:00Z"
+  "lastUpdated": "2026-06-05T00:00:00Z"
 }
