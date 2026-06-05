@@ -121,6 +121,20 @@ pieces interlock:
   branch in `setup_database` plus its server package in the Dockerfile — the
   config contract doesn't change.
 
+## Read-only auxiliary mounts (opt-in)
+
+Extra host dirs the agent may **read** are declared in a **host-side**
+`~/.config/claude-isolated/config.json` (override `CLAUDE_ISOLATED_CONFIG`),
+parsed by `claude-isolated` — **wrapper-only, no rebuild** (re-install the
+wrapper). Unlike `/workspace/.claude-isolated.json` (read inside the container,
+agent-writable), this file is **never mounted in**, so the agent cannot author
+its own mounts; that is the whole point. It must therefore NOT live under
+`$STATE_DIR` (default `~/.claude-isolated`, mounted rw as `/state`) or
+`$CLAUDE_DIR` — either would make it agent-writable and reopen the hole. Mounts
+are `-v <path>:<path>:ro` (same absolute path), validated **fail-closed** (a bad
+config aborts the launch); they add no network path, so the egress posture is
+unchanged.
+
 ## Editing rules that bite
 
 - **Allowlist overlaps are fatal.** squid refuses to start if an entry overlaps

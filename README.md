@@ -32,6 +32,7 @@ proxy.
 - [Rebuilding & updating](#rebuilding--updating)
 - [Config isolation & persistence](#config-isolation--persistence)
 - [Project databases](#project-databases)
+- [Read-only auxiliary mounts](#read-only-auxiliary-mounts)
 - [Playwright](#playwright)
 - [Environment-variable overrides](#environment-variable-overrides)
 - [Resource limits](#resource-limits)
@@ -285,6 +286,45 @@ project, drop a note in *that project's* `CLAUDE.md`, e.g.:
 > with `{"database":{"type":"postgres","name":"<db>","user":"<user>","password":"<pw>","port":<port>}}`
 > matching `DATABASE_URL`, then run the project's migrate + seed scripts. Reach
 > the DB with `psql -h localhost`.
+
+## Read-only auxiliary mounts
+
+A session sees only `/workspace`. To let the agent **read** other host
+directories (e.g. a sibling project for cross-referencing), declare them in a
+**host-side** config file — `~/.config/claude-isolated/config.json` (override
+with `CLAUDE_ISOLATED_CONFIG`). This file is **never mounted into the container**,
+so the agent cannot grant itself new read access; control stays on the host.
+(Do not place it under `$STATE_DIR`/`$CLAUDE_DIR` — those are reachable by the
+agent.)
+
+```json
+{
+  "mounts": ["/data/shared-lib"],
+  "projects": {
+    "/data/testdrive-manager": { "mounts": ["/data/testdrive-planner"] }
+  }
+}
+```
+
+- `mounts` (top level) — mounted for **every** session.
+- `projects["<abs path>"].mounts` — mounted only when you launch from that exact
+  directory. The effective set is global ∪ per-project, de-duplicated.
+
+Each path is mounted **read-only at the same absolute path**, so the agent reads
+it where it lives on the host (`cat /data/testdrive-planner/README.md`). Writes
+fail with `Read-only file system`. None of this touches the egress firewall.
+
+**Validation is fail-closed.** `jq` is required. A config that is present but
+invalid — bad JSON, `mounts` not an array of strings, a non-absolute or
+non-existent path, or a path that would shadow a container-critical directory
+(`/`, or equal-to/ancestor-of `/home /home/agent /etc /usr /bin /sbin /lib
+/lib64 /var /tmp /root /opt /boot /run /dev /proc /sys /workspace /seed /state`)
+— **aborts the launch**. A *missing* config file is fine (it just means no extra
+mounts). Subdirectories such as `/data/...` or `/home/<you>/projects/foo` are
+allowed.
+
+**Caveat.** The agent reads as uid 1000; the host files must be readable by that
+uid (or group/other). `projects` keys match the literal launch path (`$PWD`).
 
 ## Playwright
 
