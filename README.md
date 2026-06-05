@@ -31,6 +31,7 @@ proxy.
 - [Editing the allowlist (requires rebuild)](#editing-the-allowlist-requires-rebuild)
 - [Rebuilding & updating](#rebuilding--updating)
 - [Config isolation & persistence](#config-isolation--persistence)
+- [Project databases](#project-databases)
 - [Playwright](#playwright)
 - [Environment-variable overrides](#environment-variable-overrides)
 - [Resource limits](#resource-limits)
@@ -218,6 +219,67 @@ Your real `~/.claude` is mounted **read-only** (as `/seed`) and only ever copied
 
 What does **not** persist: changes to global config (settings / hooks /
 `CLAUDE.md` / plugins) — by design, since those are the host-escape vectors.
+
+## Project databases
+
+Some projects need a database (often run via `docker compose` outside the
+sandbox). Docker isn't available inside the container — and Docker-in-Docker
+would break the isolation model — but a database server is just a process on a
+port, and **loopback traffic inside the container is unrestricted**, so a
+sandbox-managed database needs no change to the egress firewall.
+
+The image ships PostgreSQL 16 **dormant**. A project opts in with a gitignored
+`/workspace/.claude-isolated.json`:
+
+```json
+{
+  "database": {
+    "type": "postgres",
+    "name": "myapp",
+    "user": "myapp",
+    "password": "myapp",
+    "port": 5432
+  }
+}
+```
+
+On launch the entrypoint inits (first run) and starts a loopback-only cluster,
+creating the role and database, so your app's `DATABASE_URL=postgresql://myapp:myapp@localhost:5432/myapp`
+just works. Reach it from inside the sandbox with `psql -h localhost -p 5432`
+(not `docker exec`).
+
+**Fields** (all optional; a `database` object must be present to trigger anything):
+
+| Key        | Default              | Notes                                          |
+|------------|----------------------|------------------------------------------------|
+| `type`     | `postgres`           | engine selector; only `postgres` is implemented (an unknown value warns and is skipped) |
+| `user`     | `postgres`           | created with LOGIN + dev superuser             |
+| `name`     | the resolved `user`  | database name, owned by `user`                 |
+| `password` | `postgres`           | set on the user                                |
+| `port`     | `5432`               | TCP port the server listens on (loopback only) |
+
+**Persistence.** Data persists **per project** under the host-separate `/state`
+dir (keyed to the project path), so you migrate/seed once and it's there next
+launch. Migrations and seeds remain your project's job — run them normally
+against `localhost`.
+
+**Caveats.**
+- Two concurrent sandbox sessions of the *same* project collide on the data dir
+  (the second one's database won't start and logs a warning) — same limitation as
+  the per-project dev-server port lanes.
+- A database that fails to start never aborts the session; it logs a `WARNING`
+  and Claude launches anyway, so you can debug it.
+
+**Gitignore the config file.** Add `.claude-isolated.json` to the project's
+`.gitignore` — it carries local credentials and is sandbox-specific.
+
+**Per-project recipe.** To tell a future agent session how to use this in a given
+project, drop a note in *that project's* `CLAUDE.md`, e.g.:
+
+> This project uses a sandbox-managed Postgres. Create `.claude-isolated.json`
+> with `{"database":{"type":"postgres","name":"<db>","user":"<user>","password":"<pw>","port":<port>}}`
+> matching `DATABASE_URL`, then run the project's migrate + seed scripts. Reach
+> the DB with `psql -h localhost`.
 
 ## Playwright
 
