@@ -24,7 +24,12 @@ if [ "$(id -u)" -eq 0 ]; then
     ready=0
     for _ in $(seq 1 100); do
         if (exec 3<>"/dev/tcp/127.0.0.1/${PROXY_PORT}") 2>/dev/null; then
-            exec 3>&- 2>/dev/null || true
+            # The probe opens fd 3 in a SUBSHELL, so it's already closed in this
+            # shell — nothing to clean up here. (A bare `exec 3>&- 2>/dev/null`
+            # would be an exec-with-no-command and permanently redirect THIS
+            # shell's stderr to /dev/null, silently swallowing every later
+            # message — including phase 2's egress-self-test FATALs and the
+            # agent's own stderr, since this fd state survives the runuser exec.)
             ready=1
             break
         fi
@@ -217,6 +222,77 @@ if [ -n "${GH_TOKEN:-}" ]; then
         && echo "[entrypoint] git configured to auth via GH_TOKEN (gh credential helper)" \
         || echo "[entrypoint] WARNING: 'gh auth setup-git' failed; pushes may prompt" >&2
 fi
+
+# --- Optional project database (opt-in via /workspace/.claude-isolated.json) --
+# Generic, engine-neutral contract: a "database" object with a "type" selects an
+# engine (only "postgres" implemented). The server is baked into the image but
+# dormant; we start it here only on request. BEST-EFFORT, never fail-closed — a
+# database that won't start is a feature failure (warn loudly, keep going), not a
+# security breach. Bound to 127.0.0.1, run as the agent uid, data persisted under
+# /state keyed per project; none of this touches the egress posture.
+
+start_postgres() {
+    local cfg="$1" user name password port
+    user="$(jq -r '.database.user // "postgres"' "$cfg")"
+    name="$(jq -r --arg u "$user" '.database.name // $u' "$cfg")"
+    password="$(jq -r '.database.password // "postgres"' "$cfg")"
+    port="$(jq -r '.database.port // 5432' "$cfg")"
+
+    local pgbin=/usr/lib/postgresql/16/bin
+    local key="${SANDBOX_PROJECT_KEY:-default}"
+    local pgdata="/state/pg/${key}/16"
+    local logfile="/state/pg/${key}/postgres-16.log"
+    mkdir -p "$pgdata"
+
+    if [ ! -f "$pgdata/PG_VERSION" ]; then
+        echo "[entrypoint] initializing Postgres cluster at $pgdata"
+        if ! "$pgbin/initdb" -D "$pgdata" -U postgres \
+                --auth-local=trust --auth-host=trust >/dev/null 2>&1; then
+            echo "[entrypoint] WARNING: initdb failed — project database unavailable" >&2
+            return 0
+        fi
+        # Loopback only (defense in depth) and a writable socket dir for the agent.
+        {
+            echo "listen_addresses = '127.0.0.1'"
+            echo "unix_socket_directories = '/tmp'"
+        } >> "$pgdata/postgresql.conf"
+    fi
+
+    if ! "$pgbin/pg_ctl" -D "$pgdata" -l "$logfile" -o "-p $port" -w -t 30 start >/dev/null 2>&1; then
+        echo "[entrypoint] WARNING: postgres did not start on port $port (concurrent session of this project? see $logfile) — continuing without a database" >&2
+        return 0
+    fi
+    echo "[entrypoint] postgres listening on 127.0.0.1:${port} (data: $pgdata)"
+
+    # Create the requested role + database (idempotent across persistent restarts).
+    local q="$pgbin/psql -h 127.0.0.1 -p $port -U postgres -d postgres -tAc"
+    if [ "$($q "SELECT 1 FROM pg_roles WHERE rolname='$user'" 2>/dev/null)" != "1" ]; then
+        $q "CREATE ROLE \"$user\" LOGIN SUPERUSER PASSWORD '$password'" >/dev/null 2>&1 \
+            && echo "[entrypoint] created role '$user'"
+    fi
+    if [ "$($q "SELECT 1 FROM pg_database WHERE datname='$name'" 2>/dev/null)" != "1" ]; then
+        $q "CREATE DATABASE \"$name\" OWNER \"$user\"" >/dev/null 2>&1 \
+            && echo "[entrypoint] created database '$name' owned by '$user'"
+    fi
+}
+
+setup_database() {
+    local cfg=/workspace/.claude-isolated.json
+    [ -f "$cfg" ] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    # Require a "database" object; absent or false => nothing to do.
+    [ "$(jq -r 'try ((.database | type) == "object") catch false' "$cfg" 2>/dev/null)" = "true" ] || return 0
+
+    local dbtype
+    dbtype="$(jq -r '.database.type // "postgres"' "$cfg" 2>/dev/null)"
+    case "$dbtype" in
+        postgres) start_postgres "$cfg" ;;
+        *) echo "[entrypoint] WARNING: unsupported database type '$dbtype' in .claude-isolated.json — skipping" >&2 ;;
+    esac
+}
+
+# Guarded so a database hiccup can never abort phase 2 (set -e is active).
+setup_database || true
 
 # Default command: a skip-permissions Claude session in the workspace. The
 # proxy + firewall + non-root user are what make that flag safe here.
