@@ -28,7 +28,7 @@ proxy.
 - [2. Install the wrapper](#2-install-the-wrapper)
 - [3. Configure (env file)](#3-configure-env-file)
 - [Usage](#usage)
-- [Editing the allowlist (requires rebuild)](#editing-the-allowlist-requires-rebuild)
+- [Editing the egress allowlist](#editing-the-egress-allowlist)
 - [Rebuilding & updating](#rebuilding--updating)
 - [Config isolation & persistence](#config-isolation--persistence)
 - [Project databases](#project-databases)
@@ -47,8 +47,10 @@ proxy.
 pointed at an in-container squid on `127.0.0.1:3128`. iptables sets `OUTPUT` to
 default-DROP and only lets the `proxy` uid reach the network (DNS + 80/443).
 So the agent's packets to anything but loopback are dropped, and the only real
-egress is squid's — which forwards **only** to hostnames in `allowlist.txt`
-(`dstdomain` match) and denies everything else. It **fails closed** at two
+egress is squid's — which forwards **only** to the hostnames in your host-side
+allowlist (`dstdomain` match; see [Editing the egress
+allowlist](#editing-the-egress-allowlist)) and denies everything else. It
+**fails closed** at two
 gates: first the entrypoint refuses to start unless squid is accepting
 connections, then — as the agent uid itself — it actively probes the egress
 posture and aborts on any security-relevant surprise. The probe runs three
@@ -76,9 +78,8 @@ copied from, never written. See [Config isolation & persistence](#config-isolati
 | File | Role |
 |---|---|
 | `Dockerfile` | arm64 image: squid, Python, gh, Playwright/Chromium, Claude Code, non-root `agent` (uid 1000) |
-| `squid.conf` | filtering forward proxy — allow allowlisted `dstdomain`, deny all |
-| `allowlist.txt` | **editable** curated egress allowlist (one `.domain` per line) |
-| `entrypoint.sh` | root phase (start proxy + program iptables) → agent phase (verify egress posture, assemble `~/.claude`, git/gh, run Claude) |
+| `squid.conf` | filtering forward proxy — allow allowlisted `dstdomain`, deny all (the allowlist itself is host-side config, written in at startup) |
+| `entrypoint.sh` | root phase (write the allowlist, start proxy + program iptables) → agent phase (verify egress posture, assemble `~/.claude`, git/gh, run Claude) |
 | `git-guard/pre-push` | rejects pushes to `main`/`master` (convenience; real guard is branch protection) |
 | `claude-isolated` | host wrapper — a plain `docker run`, one ephemeral container per session |
 
@@ -150,41 +151,63 @@ in different directories don't collide — the proxy is loopback-only, the
 container is `--rm` (no fixed name/port), and your host `~/.claude` is read-only.
 Persistent state goes to a shared, host-separate dir (see below).
 
-## Editing the allowlist (requires rebuild)
+## Editing the egress allowlist
 
-`allowlist.txt` is the **only** way out of the sandbox. To allow a new host, add
-it and **rebuild the image** (the file is COPYed in at build time):
+The allowlist is the **only** way out of the sandbox, and it lives in the
+**host-side** config file — `~/.config/claude-isolated/config.json` (override with
+`CLAUDE_ISOLATED_CONFIG`), the same file that drives [read-only auxiliary
+mounts](#read-only-auxiliary-mounts). It is **never mounted into the container**,
+so a compromised agent cannot widen its own egress; control stays on the host. On
+first run the wrapper **seeds it** with a sensible default set of domains, so
+there's one clear, transparent list to edit — **no rebuild** to add a host:
 
-```sh
-$EDITOR allowlist.txt
-docker build -t claude-sandbox:latest .
+```json
+{
+  "domains": [".anthropic.com", ".github.com", "pypi.org"],
+  "projects": {
+    "/data/testdrive-manager": { "domains": [".cupra.com"] }
+  }
+}
 ```
+
+- `domains` (top level) — allowed for **every** session.
+- `projects["<abs path>"].domains` — allowed only when you launch from that exact
+  directory. The effective set is global ∪ per-project, de-duplicated. Add a
+  domain, re-run `claude-isolated` — the new image is not needed.
 
 Rules and gotchas:
 
-- One destination per line. A **leading dot** (`.npmjs.org`) matches the domain
+- One destination per entry. A **leading dot** (`.npmjs.org`) matches the domain
   **and all subdomains, including the apex** (`npmjs.org` and `registry.npmjs.org`
   both match). A bare host (`pypi.org`) matches exactly.
 - **Do not list a domain and something it already covers** — e.g. both
   `github.com` and `.github.com`, or `.foo.com` and `a.foo.com`. squid treats
   that as a fatal config error and **won't start** (which, fail-closed, means the
   box has no network). Use a single `.domain` wildcard per site.
+- Entries are **validated fail-closed**: anything that isn't a plain
+  hostname/domain (whitespace, a slash, `:`, `@`, …) **aborts the launch**.
 - Every host you add is a potential exfiltration channel for a hijacked agent —
   keep the list tight.
 - squid logs allow/deny decisions to the container's stdout, so `docker logs`
   (or the live session output) shows exactly which host was refused.
+- **The default list does not auto-update.** Once your `config.json` exists, a
+  newer sandbox version that adds a default host won't reach it. To re-seed,
+  delete the `domains` key (or the whole file) and re-run.
 
 ## Rebuilding & updating
 
-**Rebuild the image** whenever you change anything baked into it — `allowlist.txt`,
-`squid.conf`, `Dockerfile`, `entrypoint.sh`, or `git-guard/pre-push`:
+**Rebuild the image** whenever you change anything baked into it — `squid.conf`,
+`Dockerfile`, `entrypoint.sh`, or `git-guard/pre-push`:
 
 ```sh
 docker build -t claude-sandbox:latest .
 ```
 
-Layers are cached, so config-only changes (allowlist/squid/entrypoint) rebuild in
-seconds. The next `claude-isolated` invocation uses the new image automatically.
+Layers are cached, so config-only changes (squid/entrypoint) rebuild in seconds.
+The next `claude-isolated` invocation uses the new image automatically. (Editing
+the [egress allowlist](#editing-the-egress-allowlist) or [auxiliary
+mounts](#read-only-auxiliary-mounts) needs **no rebuild** — they're host-side
+config read by the wrapper at launch.)
 
 **Re-install the wrapper** whenever you change `claude-isolated` itself (it's a
 host-side copy, not part of the image):
@@ -292,10 +315,11 @@ project, drop a note in *that project's* `CLAUDE.md`, e.g.:
 A session sees only `/workspace`. To let the agent **read** other host
 directories (e.g. a sibling project for cross-referencing), declare them in a
 **host-side** config file — `~/.config/claude-isolated/config.json` (override
-with `CLAUDE_ISOLATED_CONFIG`). This file is **never mounted into the container**,
-so the agent cannot grant itself new read access; control stays on the host.
-(Do not place it under `$STATE_DIR`/`$CLAUDE_DIR` — those are reachable by the
-agent.)
+with `CLAUDE_ISOLATED_CONFIG`). This is the same file that holds the [egress
+allowlist](#editing-the-egress-allowlist) (`domains`); it is **never mounted into
+the container**, so the agent cannot grant itself new read access; control stays
+on the host. (Do not place it under `$STATE_DIR`/`$CLAUDE_DIR` — those are
+reachable by the agent.)
 
 ```json
 {
@@ -365,7 +389,7 @@ starve the host. The default leaves headroom for several concurrent sessions on 
 |---|---|
 | `image '…' not found` | Build it from the repo root: `docker build -t claude-sandbox:latest .` |
 | `created env template … then re-run` | Expected on first run — fill in `~/.config/claude-isolated/env` |
-| A needed download/host fails | Not allowlisted. Add it to `allowlist.txt` and rebuild. Check `docker logs` for the squid deny line. |
+| A needed download/host fails | Not allowlisted. Add it to `domains` in `~/.config/claude-isolated/config.json` and re-run (no rebuild). Check `docker logs` for the squid deny line. |
 | Container exits immediately, squid `FATAL` about a `dstdomain` | Overlapping allowlist entries (a domain and its subdomain). Collapse to one `.domain`. |
 | Playwright can't reach an external (allowlisted) site | Pass `proxy: { server: 'http://127.0.0.1:3128' }` to `chromium.launch()` |
 | terraform MCP logs an error | Expected — it's a docker-image MCP and there's no docker socket in the box. Claude continues. |

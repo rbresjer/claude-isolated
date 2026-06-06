@@ -7,8 +7,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `claude-isolated` runs Claude Code with `--dangerously-skip-permissions` inside a
 hardened Docker container so the host doesn't have to trust the agent. There is no
 application code, test suite, or package manager here — the repo *is* the sandbox
-(a Dockerfile, an entrypoint, a proxy config, an egress allowlist, and a host
-wrapper). Most of the README is end-user docs; this file is about safely changing
+(a Dockerfile, an entrypoint, a proxy config, and a host wrapper; the egress
+allowlist itself is host-side config, not a baked file). Most of the README is
+end-user docs; this file is about safely changing
 the sandbox itself. Read the README for the full design rationale and threat model.
 
 Target host is **arm64/aarch64**.
@@ -32,10 +33,13 @@ cd <project> && claude-isolated [claude args...]
 sudo install -m 755 ./claude-isolated /usr/local/bin/claude-isolated
 ```
 
-**What requires what:** editing `Dockerfile`, `entrypoint.sh`, `squid.conf`,
-`allowlist.txt`, or `git-guard/pre-push` requires a **rebuild** (they are `COPY`ed
-in). Editing `claude-isolated` requires **re-installing** the wrapper (it runs on
-the host). Config-only changes rebuild in seconds thanks to layer caching.
+**What requires what:** editing `Dockerfile`, `entrypoint.sh`, `squid.conf`, or
+`git-guard/pre-push` requires a **rebuild** (they are `COPY`ed in). Editing
+`claude-isolated` requires **re-installing** the wrapper (it runs on the host).
+The egress allowlist and auxiliary mounts are **host-side config**
+(`~/.config/claude-isolated/config.json`), read by the wrapper at launch — editing
+them needs **neither** a rebuild nor a re-install. Config-only image changes
+rebuild in seconds thanks to layer caching.
 
 ## Architecture: the security model is the product
 
@@ -58,7 +62,11 @@ to start** on a breach. Three checks: (1) HARD — a direct connection bypassing
 the proxy must be dropped; it uses a literal IP over plain HTTP (`http://1.1.1.1`,
 `--noproxy '*'`) so it tests the iptables `OUTPUT` drop and not DNS/TLS — HTTPS
 would mask a breach because a failed cert check also exits non-zero. (2) HARD — a
-proxied request to a non-allowlisted host (`example.com`) must be denied by squid.
+proxied request to a non-allowlisted host must be denied by squid. The canary is a
+reserved `*.invalid` host (`sandbox-egress-canary.invalid`): squid denies it on
+the `dstdomain` ACL before any DNS (works offline) and no operator could ever
+legitimately allowlist it — unlike a real domain like `example.com`, which an
+edited allowlist could now contain and falsely trip the gate.
 (3) SOFT — a proxied request to an allowlisted host (`api.github.com/zen`) should
 succeed; failure only warns, since a stale allowlist or down network surfaces as
 a loud Claude error rather than an escape. A firewall or squid misconfig thus
@@ -67,14 +75,18 @@ launches nothing instead of silently opening the box.
 **Egress chokepoint.** Two independent layers, both must agree:
 1. iptables (`OUTPUT` default-DROP) lets *only the `proxy` uid* reach the network
    (DNS + 80/443). The agent's own packets to anything but loopback are dropped.
-2. squid (loopback `127.0.0.1:3128`) forwards only to hostnames in `allowlist.txt`
-   (`dstdomain` match) and denies all else; CONNECT is restricted to 443 so it
-   can't become a generic TCP relay.
+2. squid (loopback `127.0.0.1:3128`) forwards only to hostnames in
+   `/etc/squid/allowlist.txt` (`dstdomain` match) and denies all else; CONNECT is
+   restricted to 443 so it can't become a generic TCP relay. That file is **not**
+   baked into the image — phase 1 (root) writes it from `SANDBOX_ALLOWLIST` (the
+   wrapper passes the host-side config's `domains` in) *before* `squid -f`, since
+   squid reads the allowlist once at startup. An empty list → empty file → squid
+   denies all (fail closed).
 
 The agent is forced through squid via `HTTP(S)_PROXY` env vars set in the Dockerfile.
 So a new outbound host needs **both** an allowlist entry *and* (implicitly) the
 port already permitted by iptables — for normal HTTP(S) the ports are covered, so
-in practice you only edit `allowlist.txt`.
+in practice you only edit `domains` in the host-side config (see below).
 
 **Config isolation** (the host-escape defense). The real host `~/.claude` is
 mounted **read-only** at `/seed` and only ever *copied from* — so the agent cannot
@@ -121,26 +133,41 @@ pieces interlock:
   branch in `setup_database` plus its server package in the Dockerfile — the
   config contract doesn't change.
 
-## Read-only auxiliary mounts (opt-in)
+## Host-side config: egress allowlist + read-only auxiliary mounts
 
-Extra host dirs the agent may **read** are declared in a **host-side**
-`~/.config/claude-isolated/config.json` (override `CLAUDE_ISOLATED_CONFIG`),
-parsed by `claude-isolated` — **wrapper-only, no rebuild** (re-install the
-wrapper). Unlike `/workspace/.claude-isolated.json` (read inside the container,
-agent-writable), this file is **never mounted in**, so the agent cannot author
-its own mounts; that is the whole point. It must therefore NOT live under
-`$STATE_DIR` (default `~/.claude-isolated`, mounted rw as `/state`) or
-`$CLAUDE_DIR` — either would make it agent-writable and reopen the hole. Mounts
-are `-v <path>:<path>:ro` (same absolute path), validated **fail-closed** (a bad
-config aborts the launch); they add no network path, so the egress posture is
-unchanged.
+Both the egress allowlist (`domains`) and extra readable host dirs (`mounts`) are
+declared in a single **host-side** `~/.config/claude-isolated/config.json`
+(override `CLAUDE_ISOLATED_CONFIG`), parsed by `claude-isolated` — **wrapper-only,
+no rebuild** (re-install the wrapper only if you change the wrapper itself).
+Unlike `/workspace/.claude-isolated.json` (read inside the container,
+agent-writable), this file is **never mounted in**, so the agent can neither widen
+its own egress nor author its own mounts; that is the whole point. It must
+therefore NOT live under `$STATE_DIR` (default `~/.claude-isolated`, mounted rw as
+`/state`) or `$CLAUDE_DIR` — either would make it agent-writable and reopen the
+hole. Both keys take a top-level array plus per-launch-dir
+`projects["<abs>"].{domains,mounts}`, composed additively and validated
+**fail-closed** (a bad config aborts the launch — no container).
+
+- **`domains`** — squid `dstdomain` entries (verbatim dot-convention: `.x.com` =
+  apex+subdomains, `x.com` = exact). The wrapper **seeds a default set on first
+  run** (the file is the single source of truth — there is no baked `allowlist.txt`
+  anymore), validates each entry is a plain hostname, dedups, and passes them as
+  `SANDBOX_ALLOWLIST`; phase 1 writes them to `/etc/squid/allowlist.txt` before
+  squid starts. Editing this is the *only* way to change egress.
+- **`mounts`** — `-v <path>:<path>:ro` (same absolute path); add no network path,
+  so the egress posture is unchanged. A path that would shadow a container-critical
+  dir is rejected (see the `protected` list in the wrapper).
 
 ## Editing rules that bite
 
 - **Allowlist overlaps are fatal.** squid refuses to start if an entry overlaps
   another (e.g. both `github.com` and `.github.com`, or `.foo.com` and `a.foo.com`).
   Use **one** broad `.domain` per site. A non-starting squid means a no-network
-  (fail-closed) box. Every host added is a potential exfil channel — keep it tight.
+  (fail-closed) box. This now bites at *config* edit time (`domains` in the
+  host-side config), not at image-build time, and the seed default + per-project
+  entries can overlap too. Every host added is a potential exfil channel — keep it
+  tight. (If you change the seed default list, it lives in the `claude-isolated`
+  heredoc, not a baked file.)
 - **entrypoint.sh / pre-push must be world-readable (0755), not just executable.**
   A script invoked via its shebang must be *readable* by whoever runs it; `chmod +x`
   on a 0600 file leaves 0711 and phase 2 dies with "Permission denied". The

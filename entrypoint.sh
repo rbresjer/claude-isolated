@@ -15,6 +15,18 @@ PROXY_PORT=3128
 if [ "$(id -u)" -eq 0 ]; then
     proxy_uid="$(id -u proxy)"
 
+    # Materialize the egress allowlist squid reads. It is the single source of
+    # truth for egress and is supplied by the host (the wrapper passes the
+    # host-side config's domains in SANDBOX_ALLOWLIST). One dstdomain entry per
+    # line; an empty list yields an empty file -> squid denies all (fail closed).
+    # Written BEFORE squid starts, because squid reads the allowlist once at boot.
+    mkdir -p /etc/squid
+    : > /etc/squid/allowlist.txt
+    for host in ${SANDBOX_ALLOWLIST:-}; do
+        printf '%s\n' "$host" >> /etc/squid/allowlist.txt
+    done
+    echo "[entrypoint] wrote $(wc -l < /etc/squid/allowlist.txt) egress allowlist entries"
+
     echo "[entrypoint] starting filtering proxy (squid) on 127.0.0.1:${PROXY_PORT}"
     # squid daemonizes; its worker runs as the 'proxy' user, the only uid the
     # firewall below lets reach the network.
@@ -114,8 +126,12 @@ fi
 #      cleanly connects to 1.1.1.1:80 and curl exits 0. (HTTPS would muddy this —
 #      a failed cert check also exits non-zero, masking a real breach.)
 #   2. HARD — a request THROUGH the proxy to a non-allowlisted host must be denied
-#      by squid (403), proving deny-all is in force, not merely that squid is up.
-#      squid rejects on the dstdomain ACL before any DNS, so this works offline.
+#      by squid, proving deny-all is in force, not merely that squid is up. The
+#      canary is a reserved *.invalid host: squid rejects it on the dstdomain ACL
+#      before any DNS (so this works offline), and — unlike a real domain such as
+#      example.com — no operator could ever legitimately allowlist it and brick
+#      the boot. HTTPS so a denied CONNECT makes curl fail; a plain-HTTP 403 would
+#      be a "successful" response (curl exits 0) and read as a breach.
 #   3. SOFT — a request through the proxy to an allowlisted host should succeed;
 #      failure usually means the network is down or the allowlist is too tight, so
 #      warn rather than abort.
@@ -128,7 +144,7 @@ if curl --noproxy '*' --silent --connect-timeout 5 --output /dev/null \
 fi
 
 if curl --silent --connect-timeout 5 --output /dev/null \
-        https://example.com 2>/dev/null; then
+        https://sandbox-egress-canary.invalid 2>/dev/null; then
     echo "[entrypoint] FATAL: proxy forwarded a non-allowlisted host (squid is not denying) — refusing to start" >&2
     exit 1
 fi

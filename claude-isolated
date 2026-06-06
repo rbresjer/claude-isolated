@@ -119,18 +119,86 @@ if [ -n "${CLAUDE_ISOLATED_PORTS:-}" ]; then
     done
 fi
 
-# --- Optional: read-only auxiliary mounts (host-controlled) -------------------
-# Extra host directories the agent may READ, declared in a HOST-side config file
-# that is never mounted into the container — so a compromised agent cannot grant
-# itself new read access. `mounts` (top level) apply to every session; entries
-# under `projects["<abs path>"].mounts` apply only when launched from that path.
-# Each resolved path is mounted READ-ONLY at the SAME absolute path. Fail closed:
-# a config that exists but is malformed, or that names a non-existent/unsafe path,
-# ABORTS the launch (no container) rather than silently dropping the mount.
+# --- Seed the host-side egress allowlist on first run -------------------------
+# The egress allowlist is the SINGLE SOURCE OF TRUTH for what the agent can reach,
+# and it lives HERE — in the host-side config, never mounted into the container,
+# so a compromised agent cannot edit it. Seed a sane default set on first run;
+# thereafter the file is yours to edit (add a domain and re-run — NO rebuild).
+# Entries use squid dstdomain semantics: a leading dot (".npmjs.org") matches the
+# domain AND all subdomains; a bare entry ("pypi.org") matches that exact host.
+# squid refuses to start if two entries overlap (e.g. "github.com" and
+# ".github.com"), which fails closed (no network) — use ONE broad ".domain" per site.
+if [ ! -f "$CONFIG_FILE" ]; then
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    cat > "$CONFIG_FILE" <<'SEED'
+{
+  "domains": [
+    ".anthropic.com",
+    ".claude.ai",
+    ".claude.com",
+    ".npmjs.org",
+    ".npmjs.com",
+    "pypi.org",
+    ".pythonhosted.org",
+    ".github.com",
+    ".githubusercontent.com",
+    ".playwright.azureedge.net",
+    ".playwright.dev",
+    "playwright.download.prss.microsoft.com",
+    ".context7.com",
+    ".upstash.io",
+    ".readthedocs.io",
+    "developer.mozilla.org",
+    "docs.python.org",
+    "pkg.go.dev",
+    ".nodejs.org"
+  ],
+  "projects": {},
+  "mounts": []
+}
+SEED
+    echo "claude-isolated: seeded default egress allowlist at '$CONFIG_FILE'" >&2
+fi
+
+# --- Host-controlled config: egress allowlist + read-only auxiliary mounts -----
+# Both are declared in the HOST-side config file that is never mounted into the
+# container — so a compromised agent can neither widen its own egress nor grant
+# itself new read access. Top-level keys (`domains`, `mounts`) apply to every
+# session; entries under `projects["<abs path>"].{domains,mounts}` apply only when
+# launched from that path. Both compose additively. Fail closed: a config that
+# exists but is malformed, or that names an invalid value, ABORTS the launch (no
+# container) rather than silently dropping the entry.
+#   - domains: squid dstdomain entries; mounted READ paths: same-path READ-ONLY.
+ALLOW_DOMAINS=""
 MOUNT_ARGS=()
 if [ -f "$CONFIG_FILE" ]; then
     jq empty "$CONFIG_FILE" >/dev/null 2>&1 \
         || die "config '$CONFIG_FILE' is not valid JSON"
+
+    # Global + per-project egress domains, one per line. A type error (e.g.
+    # `domains` is a string) makes jq exit non-zero -> die, so a malformed shape
+    # fails closed. An empty/absent list yields no extra egress.
+    if ! domains_raw="$(jq -r \
+            '((.domains // []) + (.projects[$pwd].domains // []))[]' \
+            --arg pwd "$PWD" "$CONFIG_FILE" 2>/dev/null)"; then
+        die "config '$CONFIG_FILE': 'domains' must be arrays of strings"
+    fi
+
+    declare -A seen_domains=()
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        # These strings are written verbatim into squid's allowlist file, so
+        # reject anything that isn't a plain hostname/domain: optional leading
+        # dot, then dot-separated alphanumeric/hyphen labels. No whitespace,
+        # slashes, ':', '@', or control characters.
+        if ! printf '%s' "$d" | grep -Eq '^\.?([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$'; then
+            die "invalid domain in allowlist: '$d' (expected a host like .example.com or pypi.org)"
+        fi
+        if [ -z "${seen_domains[$d]:-}" ]; then
+            seen_domains[$d]=1
+            ALLOW_DOMAINS="${ALLOW_DOMAINS}${ALLOW_DOMAINS:+ }${d}"
+        fi
+    done <<< "$domains_raw"
 
     # Global + per-project mounts, one path per line. A type error (e.g. `mounts`
     # is a string, or `projects` is not an object) makes jq exit non-zero -> die,
@@ -185,6 +253,7 @@ exec docker run --rm -it \
     --pids-limit 512 --memory 4g --cpus "${CLAUDE_ISOLATED_CPUS:-1.5}" \
     --env-file "$ENVFILE" \
     -e "SANDBOX_PORTS=$INPUT_PORTS" \
+    -e "SANDBOX_ALLOWLIST=$ALLOW_DOMAINS" \
     -e "HOST_CLAUDE_DIR=$CLAUDE_DIR" \
     -e "SANDBOX_PROJECT_KEY=$PROJECT_KEY" \
     ${PORT_ARGS[@]+"${PORT_ARGS[@]}"} \

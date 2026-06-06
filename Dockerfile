@@ -82,9 +82,12 @@ RUN userdel -r node 2>/dev/null || true \
     && groupadd -g 1000 agent \
     && useradd -m -u 1000 -g 1000 -s /bin/bash agent
 
-# --- Proxy config + egress allowlist ----------------------------------------
+# --- Proxy config ------------------------------------------------------------
+# The egress allowlist is NOT baked in: it is the host-side config's single
+# source of truth, written to /etc/squid/allowlist.txt at startup by the
+# entrypoint (from SANDBOX_ALLOWLIST) before squid boots. squid.conf reads that
+# path. Adding a host is a config edit + re-run — no rebuild.
 COPY squid.conf    /etc/squid/squid.conf
-COPY allowlist.txt /etc/squid/allowlist.txt
 
 # --- Entry + git push guard --------------------------------------------------
 COPY entrypoint.sh        /usr/local/bin/entrypoint.sh
