@@ -24,6 +24,10 @@ CLAUDE_DIR="${CLAUDE_ISOLATED_CLAUDE_DIR:-$HOME/.claude}"
 # Persistent, host-separate sandbox state (conversations, memory, .claude.json).
 # Defaults to a sibling of your config dir on the same volume.
 STATE_DIR="${CLAUDE_ISOLATED_STATE:-$(dirname "$CLAUDE_DIR")/.claude-isolated}"
+# Host-side, structured (non-secret) settings — read-only auxiliary mounts, etc.
+# NEVER mounted into the container, so the agent cannot author it. Must NOT live
+# under $STATE_DIR/$CLAUDE_DIR (those are reachable by the agent).
+CONFIG_FILE="${CLAUDE_ISOLATED_CONFIG:-$HOME/.config/claude-isolated/config.json}"
 
 die() { echo "claude-isolated: $*" >&2; exit 1; }
 
@@ -31,6 +35,7 @@ die() { echo "claude-isolated: $*" >&2; exit 1; }
 command -v docker >/dev/null 2>&1 || die "docker not found on PATH"
 docker image inspect "$IMAGE" >/dev/null 2>&1 \
     || die "image '$IMAGE' not found — build it first:  docker build -t $IMAGE $(dirname "$0")"
+command -v jq >/dev/null 2>&1 || die "jq not found on PATH (required to parse config)"
 
 [ -d "$CLAUDE_DIR" ] || die "claude config dir '$CLAUDE_DIR' not found"
 
@@ -114,6 +119,57 @@ if [ -n "${CLAUDE_ISOLATED_PORTS:-}" ]; then
     done
 fi
 
+# --- Optional: read-only auxiliary mounts (host-controlled) -------------------
+# Extra host directories the agent may READ, declared in a HOST-side config file
+# that is never mounted into the container — so a compromised agent cannot grant
+# itself new read access. `mounts` (top level) apply to every session; entries
+# under `projects["<abs path>"].mounts` apply only when launched from that path.
+# Each resolved path is mounted READ-ONLY at the SAME absolute path. Fail closed:
+# a config that exists but is malformed, or that names a non-existent/unsafe path,
+# ABORTS the launch (no container) rather than silently dropping the mount.
+MOUNT_ARGS=()
+if [ -f "$CONFIG_FILE" ]; then
+    jq empty "$CONFIG_FILE" >/dev/null 2>&1 \
+        || die "config '$CONFIG_FILE' is not valid JSON"
+
+    # Global + per-project mounts, one path per line. A type error (e.g. `mounts`
+    # is a string, or `projects` is not an object) makes jq exit non-zero -> die,
+    # so a malformed shape fails closed. An empty/absent list yields no output.
+    if ! mounts_raw="$(jq -r \
+            '((.mounts // []) + (.projects[$pwd].mounts // []))[]' \
+            --arg pwd "$PWD" "$CONFIG_FILE" 2>/dev/null)"; then
+        die "config '$CONFIG_FILE': 'mounts' must be arrays of strings"
+    fi
+
+    # Container-critical paths a read-only same-path mount must never shadow
+    # (mounting one of these, or an ancestor of one, would clobber the sandbox's
+    # own filesystem). Subdirectories like /data/... or /home/<you>/proj are fine.
+    protected="/home /home/agent /etc /usr /bin /sbin /lib /lib64 /var /tmp /root /opt /boot /run /dev /proc /sys /workspace /seed /state"
+
+    declare -A seen=()
+    while IFS= read -r m; do
+        [ -n "$m" ] || continue
+        case "$m" in
+            /*) ;;
+            *)  die "mount path must be absolute: '$m'" ;;
+        esac
+        [ -e "$m" ] || die "mount path does not exist: '$m'"
+        rp="$(realpath -e "$m" 2>/dev/null)" || die "cannot resolve mount path: '$m'"
+        [ "$rp" != "/" ] || die "refusing to mount '/' (would shadow the container filesystem)"
+        for p in $protected; do
+            # reject if rp IS p, or rp is an ANCESTOR of p (p lies under rp)
+            if [ "$rp" = "$p" ] || [ "${p#"$rp"/}" != "$p" ]; then
+                die "refusing mount '$rp': would shadow container path '$p'"
+            fi
+        done
+        if [ -z "${seen[$rp]:-}" ]; then
+            seen[$rp]=1
+            MOUNT_ARGS+=( -v "$rp:$rp:ro" )
+            echo "claude-isolated: read-only mount $rp" >&2
+        fi
+    done <<< "$mounts_raw"
+fi
+
 # --- Launch ------------------------------------------------------------------
 # Mounts:
 #   /workspace           rw  — the current project (only host code path exposed)
@@ -132,6 +188,7 @@ exec docker run --rm -it \
     -e "HOST_CLAUDE_DIR=$CLAUDE_DIR" \
     -e "SANDBOX_PROJECT_KEY=$PROJECT_KEY" \
     ${PORT_ARGS[@]+"${PORT_ARGS[@]}"} \
+    ${MOUNT_ARGS[@]+"${MOUNT_ARGS[@]}"} \
     -v "$PWD:/workspace" -w /workspace \
     -v "$CLAUDE_DIR:/seed:ro" \
     -v "$STATE_DIR:/state" \
