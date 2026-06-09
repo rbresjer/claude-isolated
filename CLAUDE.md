@@ -139,19 +139,20 @@ overrides detection; `"database": false` disables it). Three pieces interlock:
   warning). Adding another engine (e.g. MySQL) is a new `case` branch plus its
   server package in the Dockerfile — the config contract doesn't change.
 
-## Host-side config: egress allowlist + read-only auxiliary mounts
+## Host-side config: egress allowlist + read-only mounts + dev-server ports
 
-Both the egress allowlist (`domains`) and extra readable host dirs (`mounts`) are
-declared in a single **host-side** `~/.config/claude-isolated/config.json`
-(override `CLAUDE_ISOLATED_CONFIG`), parsed by `claude-isolated` — **wrapper-only,
-no rebuild** (re-install the wrapper only if you change the wrapper itself).
-Unlike `/workspace/.claude-isolated.json` (read inside the container,
-agent-writable), this file is **never mounted in**, so the agent can neither widen
-its own egress nor author its own mounts; that is the whole point. It must
-therefore NOT live under `$STATE_DIR` (default `~/.claude-isolated`, mounted rw as
-`/state`) or `$CLAUDE_DIR` — either would make it agent-writable and reopen the
-hole. Both keys take a top-level array plus per-launch-dir
-`projects["<abs>"].{domains,mounts}`, composed additively and validated
+The egress allowlist (`domains`), extra readable host dirs (`mounts`), and
+published dev-server ports (`ports`) are all declared in a single **host-side**
+`~/.config/claude-isolated/config.json` (override `CLAUDE_ISOLATED_CONFIG`),
+parsed by `claude-isolated` — **wrapper-only, no rebuild** (re-install the wrapper
+only if you change the wrapper itself). Unlike `/workspace/.claude-isolated.json`
+(read inside the container, agent-writable), this file is **never mounted in**, so
+the agent can neither widen its own egress, author its own mounts, nor publish its
+own inbound ports; that is the whole point. It must therefore NOT live under
+`$STATE_DIR` (default `~/.claude-isolated`, mounted rw as `/state`) or
+`$CLAUDE_DIR` — either would make it agent-writable and reopen the hole. All three
+keys take a top-level array plus per-launch-dir
+`projects["<abs>"].{domains,mounts,ports}`, composed additively and validated
 **fail-closed** (a bad config aborts the launch — no container).
 
 - **`domains`** — squid `dstdomain` entries (verbatim dot-convention: `.x.com` =
@@ -163,6 +164,17 @@ hole. Both keys take a top-level array plus per-launch-dir
 - **`mounts`** — `-v <path>:<path>:ro` (same absolute path); add no network path,
   so the egress posture is unchanged. A path that would shadow a container-critical
   dir is rejected (see the `protected` list in the wrapper).
+- **`ports`** — dev-server ports to publish, each `"CONTAINER"` (host port
+  auto-assigned from the project's hashed lane, 20000–51999) or `"HOST:CONTAINER"`
+  (explicit). The wrapper validates each is `digits[:digits]`, dedups by host port,
+  `-p`-publishes them on the host's **Tailscale IP** (override
+  `CLAUDE_ISOLATED_BIND_IP`; no tailnet → `127.0.0.1`, host-local only), and passes
+  the container ports as `SANDBOX_PORTS`; the entrypoint opens a matching `INPUT`
+  ACCEPT (the container firewall is default-DROP inbound, so a published port alone
+  is not enough). Reachable from other tailnet clients but never the public/private
+  ENI — the egress posture is untouched. The dev server must bind `0.0.0.0`
+  in-container, else the forwarded packet lands nowhere. There is **no** env-var
+  path (the former `CLAUDE_ISOLATED_PORTS` is gone) — config is the only way in.
 
 ## Editing rules that bite
 

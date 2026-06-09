@@ -88,47 +88,6 @@ project_base="${project_base//[!A-Za-z0-9._-]/_}"   # sanitize without piping ba
 project_hash="$(printf '%s' "$PWD" | sha256sum | cut -c1-12)"
 PROJECT_KEY="${project_base}-${project_hash}"
 
-# --- Optional: publish dev-server ports to the Tailscale interface ------------
-# Opt-in via CLAUDE_ISOLATED_PORTS (space/comma list). Each entry is either a
-# bare CONTAINER port (host port auto-assigned, below) or an explicit
-# HOST:CONTAINER pair. Host ports bind ONLY to the host's Tailscale IP, so the
-# server is reachable from other tailnet clients but never the public/private
-# ENI. The entrypoint opens a matching INPUT rule inside the container (its
-# firewall is default-DROP, so a published port alone is not enough).
-#
-# Deterministic host ports: containers are ephemeral and many run concurrently,
-# so they can't all grab the same host port. Each project ($PWD) gets a private
-# "lane" of host ports derived from a hash of its path — a given project always
-# lands on the same numbers, distinct projects don't collide, and there's
-# nothing to track. The Nth exposed port of a project is lane_base+N. Two
-# concurrent sessions of the SAME project collide on the host port (docker says
-# "port is already allocated"); override with an explicit HOST:CONTAINER then.
-PORT_ARGS=()
-INPUT_PORTS=""
-if [ -n "${CLAUDE_ISOLATED_PORTS:-}" ]; then
-    bind_ip="${CLAUDE_ISOLATED_BIND_IP:-$(tailscale ip -4 2>/dev/null | head -1 || true)}"
-    if [ -z "$bind_ip" ]; then
-        bind_ip=127.0.0.1
-        echo "claude-isolated: no Tailscale IP found — binding published ports to 127.0.0.1 (host-local only)" >&2
-    fi
-    # Per-project lane base: 2000 lanes of 16 ports each, spanning 20000–51999.
-    lane_hash="$(printf '%s' "$PWD" | cksum | cut -d' ' -f1)"
-    lane_base=$(( 20000 + (lane_hash % 2000) * 16 ))
-    idx=0
-    for entry in ${CLAUDE_ISOLATED_PORTS//,/ }; do
-        case "$entry" in
-            *:*) host_port="${entry%%:*}"; cont_port="${entry##*:}" ;;
-            *)   cont_port="$entry";       host_port=$(( lane_base + idx )) ;;
-        esac
-        case "$cont_port" in ''|*[!0-9]*) die "invalid port in CLAUDE_ISOLATED_PORTS: '$entry'" ;; esac
-        case "$host_port" in ''|*[!0-9]*) die "invalid port in CLAUDE_ISOLATED_PORTS: '$entry'" ;; esac
-        PORT_ARGS+=( -p "${bind_ip}:${host_port}:${cont_port}" )
-        INPUT_PORTS="${INPUT_PORTS}${INPUT_PORTS:+ }${cont_port}"
-        echo "claude-isolated: exposing container :${cont_port} -> http://${bind_ip}:${host_port}" >&2
-        idx=$(( idx + 1 ))
-    done
-fi
-
 # --- Seed the host-side egress allowlist on first run -------------------------
 # The egress allowlist is the SINGLE SOURCE OF TRUTH for what the agent can reach,
 # and it lives HERE — in the host-side config, never mounted into the container,
@@ -164,23 +123,28 @@ if [ ! -f "$CONFIG_FILE" ]; then
     ".nodejs.org"
   ],
   "projects": {},
-  "mounts": []
+  "mounts": [],
+  "ports": []
 }
 SEED
     echo "claude-isolated: seeded default egress allowlist at '$CONFIG_FILE'" >&2
 fi
 
-# --- Host-controlled config: egress allowlist + read-only auxiliary mounts -----
-# Both are declared in the HOST-side config file that is never mounted into the
-# container — so a compromised agent can neither widen its own egress nor grant
-# itself new read access. Top-level keys (`domains`, `mounts`) apply to every
-# session; entries under `projects["<abs path>"].{domains,mounts}` apply only when
-# launched from that path. Both compose additively. Fail closed: a config that
-# exists but is malformed, or that names an invalid value, ABORTS the launch (no
-# container) rather than silently dropping the entry.
-#   - domains: squid dstdomain entries; mounted READ paths: same-path READ-ONLY.
+# --- Host-controlled config: egress allowlist + mounts + dev-server ports ------
+# All are declared in the HOST-side config file that is never mounted into the
+# container — so a compromised agent can neither widen its own egress, grant
+# itself new read access, nor publish its own inbound ports. Top-level keys
+# (`domains`, `mounts`, `ports`) apply to every session; entries under
+# `projects["<abs path>"].{domains,mounts,ports}` apply only when launched from
+# that path. All compose additively. Fail closed: a config that exists but is
+# malformed, or that names an invalid value, ABORTS the launch (no container)
+# rather than silently dropping the entry.
+#   - domains: squid dstdomain entries; mounted READ paths: same-path READ-ONLY;
+#     ports: published to the host's Tailscale IP and opened inbound in-container.
 ALLOW_DOMAINS=""
 MOUNT_ARGS=()
+PORT_ARGS=()
+INPUT_PORTS=""
 if [ -f "$CONFIG_FILE" ]; then
     jq empty "$CONFIG_FILE" >/dev/null 2>&1 \
         || die "config '$CONFIG_FILE' is not valid JSON"
@@ -246,6 +210,59 @@ if [ -f "$CONFIG_FILE" ]; then
             echo "claude-isolated: read-only mount $rp" >&2
         fi
     done <<< "$mounts_raw"
+
+    # Global + per-project dev-server ports, one entry per line. Each is either a
+    # bare CONTAINER port (host port auto-assigned, below) or an explicit
+    # HOST:CONTAINER pair. A type error (e.g. `ports` is a string) makes jq exit
+    # non-zero -> die, so a malformed shape fails closed. Host ports bind ONLY to
+    # the host's Tailscale IP, so the server is reachable from other tailnet
+    # clients but never the public/private ENI; the entrypoint opens a matching
+    # INPUT rule inside the container (its firewall is default-DROP, so a
+    # published port alone is not enough).
+    if ! ports_raw="$(jq -r \
+            '((.ports // []) + (.projects[$pwd].ports // []))[]' \
+            --arg pwd "$PWD" "$CONFIG_FILE" 2>/dev/null)"; then
+        die "config '$CONFIG_FILE': 'ports' must be arrays of strings/numbers"
+    fi
+
+    if [ -n "$ports_raw" ]; then
+        # Bind target: the host's Tailscale IP (override with CLAUDE_ISOLATED_BIND_IP).
+        # No tailnet -> fall back to loopback, reachable only on this host.
+        bind_ip="${CLAUDE_ISOLATED_BIND_IP:-$(tailscale ip -4 2>/dev/null | head -1 || true)}"
+        if [ -z "$bind_ip" ]; then
+            bind_ip=127.0.0.1
+            echo "claude-isolated: no Tailscale IP found — binding published ports to 127.0.0.1 (host-local only)" >&2
+        fi
+        # Deterministic host ports: containers are ephemeral and many run
+        # concurrently, so they can't all grab the same host port. Each project
+        # ($PWD) gets a private "lane" of host ports derived from a hash of its
+        # path — a given project always lands on the same numbers, distinct
+        # projects don't collide, and there's nothing to track. The Nth bare port
+        # of a project is lane_base+N. Two concurrent sessions of the SAME project
+        # collide on the host port (docker says "port is already allocated");
+        # override with an explicit HOST:CONTAINER then.
+        # Per-project lane base: 2000 lanes of 16 ports each, spanning 20000–51999.
+        lane_hash="$(printf '%s' "$PWD" | cksum | cut -d' ' -f1)"
+        lane_base=$(( 20000 + (lane_hash % 2000) * 16 ))
+        declare -A seen_ports=()
+        idx=0
+        while IFS= read -r entry; do
+            [ -n "$entry" ] || continue
+            case "$entry" in
+                *:*) host_port="${entry%%:*}"; cont_port="${entry##*:}" ;;
+                *)   cont_port="$entry";       host_port=$(( lane_base + idx )) ;;
+            esac
+            case "$cont_port" in ''|*[!0-9]*) die "invalid port in config: '$entry' (expected CONTAINER or HOST:CONTAINER)" ;; esac
+            case "$host_port" in ''|*[!0-9]*) die "invalid port in config: '$entry' (expected CONTAINER or HOST:CONTAINER)" ;; esac
+            if [ -z "${seen_ports[$host_port]:-}" ]; then
+                seen_ports[$host_port]=1
+                PORT_ARGS+=( -p "${bind_ip}:${host_port}:${cont_port}" )
+                INPUT_PORTS="${INPUT_PORTS}${INPUT_PORTS:+ }${cont_port}"
+                echo "claude-isolated: exposing container :${cont_port} -> http://${bind_ip}:${host_port}" >&2
+            fi
+            idx=$(( idx + 1 ))
+        done <<< "$ports_raw"
+    fi
 fi
 
 # --- Launch ------------------------------------------------------------------
@@ -256,7 +273,7 @@ fi
 #   /home/agent/.claude.json rw — the sandbox's own .claude.json (not your host's)
 # The entrypoint assembles /home/agent/.claude from /seed + /state at startup.
 # SANDBOX_PORTS tells the entrypoint which container ports to open inbound; the
-# -p rules in PORT_ARGS publish them on the Tailscale IP (see the block above).
+# -p rules in PORT_ARGS publish them on the Tailscale IP (see the config block).
 exec docker run --rm -it \
     --cap-drop ALL --cap-add NET_ADMIN --cap-add SETUID --cap-add SETGID \
     --security-opt no-new-privileges \

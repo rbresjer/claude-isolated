@@ -72,7 +72,8 @@ if [ "$(id -u)" -eq 0 ]; then
     iptables -A OUTPUT -m owner --uid-owner "$proxy_uid" -p tcp --dport 80  -j ACCEPT
     iptables -A OUTPUT -m owner --uid-owner "$proxy_uid" -p tcp --dport 443 -j ACCEPT
 
-    # Inbound dev-server ports (opt-in, set by the wrapper's CLAUDE_ISOLATED_PORTS).
+    # Inbound dev-server ports (opt-in via `ports` in the host-side config; the
+    # wrapper resolves them and passes the container ports in via SANDBOX_PORTS).
     # Docker DNATs the host's Tailscale port to this container; the packet arrives
     # here as a NEW inbound connection, so without an explicit ACCEPT the
     # default-DROP INPUT policy below would silently swallow it.
