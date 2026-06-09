@@ -21,6 +21,16 @@ set -euo pipefail
 IMAGE="${CLAUDE_ISOLATED_IMAGE:-claude-sandbox:latest}"
 ENVFILE="${CLAUDE_ISOLATED_ENV:-$HOME/.config/claude-isolated/env}"
 CLAUDE_DIR="${CLAUDE_ISOLATED_CLAUDE_DIR:-$HOME/.claude}"
+# Canonicalize before anything derives from it. If ~/.claude is a symlink (e.g.
+# /home/you/.claude -> /data/.claude), Claude Code bakes the *real* target into
+# settings.json hook commands and the plugin manifests, while the entrypoint
+# creates its in-container resolver symlink at HOST_CLAUDE_DIR. If we passed the
+# symlink path, that resolver would land on the wrong name and every baked
+# /data/.claude/... reference would dangle — e.g. the Bash PreToolUse hook fails
+# with "missing script" on every command. Resolving here keeps HOST_CLAUDE_DIR
+# equal to the path the config actually references. (Falls back to the original
+# if realpath can't resolve it; the -d check below then reports a clear error.)
+CLAUDE_DIR="$(realpath "$CLAUDE_DIR" 2>/dev/null || printf '%s' "$CLAUDE_DIR")"
 # Persistent, host-separate sandbox state (conversations, memory, .claude.json).
 # Defaults to a sibling of your config dir on the same volume.
 STATE_DIR="${CLAUDE_ISOLATED_STATE:-$(dirname "$CLAUDE_DIR")/.claude-isolated}"
