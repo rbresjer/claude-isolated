@@ -193,6 +193,28 @@ if [ -d /state ]; then
     ln -sfn /state/projects      "$CLAUDE_HOME/projects"
     ln -sfn /state/todos         "$CLAUDE_HOME/todos"
     ln -sfn /state/history.jsonl "$CLAUDE_HOME/history.jsonl"
+
+    # Persist pnpm's content-addressed store under /state so installs are cached
+    # across sessions instead of re-downloading (and re-hitting egress) each run.
+    # The host's own store (e.g. /home/ubuntu/.local/share/pnpm) is intentionally
+    # not mounted and not writable by the agent; a project's node_modules may even
+    # record that stale path. Pointing pnpm at this agent-owned store means a plain
+    # `pnpm install` relinks cleanly here. Shared across all projects: the store is
+    # content-addressed, so sharing is safe and dedupes. Best-effort, never fatal.
+    #
+    # We write store-dir to ~/.npmrc directly instead of shelling out to
+    # `pnpm config set`: pnpm is a corepack shim, and *invoking* it can re-resolve
+    # its version against the npm registry and, on a cache miss, block on
+    # corepack's interactive "about to download" prompt — a silent hang inside the
+    # entrypoint (output is redirected). The Dockerfile hardens corepack against
+    # this (pinned PNPM_VERSION, world-readable COREPACK_HOME, prompt disabled), but
+    # the entrypoint avoids the shim entirely regardless: a file write needs no
+    # network and cannot prompt. pnpm reads store-dir from ~/.npmrc.
+    mkdir -p /state/pnpm/store
+    if ! grep -qs '^store-dir=' /home/agent/.npmrc 2>/dev/null; then
+        echo 'store-dir=/state/pnpm/store' >> /home/agent/.npmrc \
+            && echo "[entrypoint] pnpm store -> /state/pnpm/store (cached across sessions)"
+    fi
 fi
 
 # --- Graft host login markers into the sandbox's .claude.json ------------------

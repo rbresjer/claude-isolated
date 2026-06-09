@@ -105,7 +105,11 @@ docker build -t claude-sandbox:latest .
 ```
 
 The Claude Code version is pinned via a build arg (`CLAUDE_CODE_VERSION`,
-default `2.1.161`); override with `--build-arg CLAUDE_CODE_VERSION=X.Y.Z`.
+default `2.1.161`); override with `--build-arg CLAUDE_CODE_VERSION=X.Y.Z`. The
+pnpm version is likewise pinned (`PNPM_VERSION`, default `11.5.1`) — a concrete
+version rather than the `latest` tag so corepack resolves it from the baked-in
+cache offline instead of re-fetching it from the npm registry on every `pnpm`
+invocation.
 
 ## 2. Install the wrapper
 
@@ -216,10 +220,11 @@ host-side copy, not part of the image):
 sudo install -m 755 ./claude-isolated /usr/local/bin/claude-isolated
 ```
 
-**Bump Claude Code:**
+**Bump Claude Code (or pnpm):**
 
 ```sh
 docker build -t claude-sandbox:latest --build-arg CLAUDE_CODE_VERSION=X.Y.Z .
+docker build -t claude-sandbox:latest --build-arg PNPM_VERSION=X.Y.Z .
 ```
 
 ## Config isolation & persistence
@@ -239,6 +244,15 @@ Your real `~/.claude` is mounted **read-only** (as `/seed`) and only ever copied
   **persist across runs** and are shared between sandbox sessions, but are kept
   entirely apart from your real `~/.claude`. Inspect or wipe that dir freely;
   it's created automatically on first run.
+- **pnpm store** — pointed at `$STATE_DIR/pnpm/store` so package downloads are
+  cached across sessions (shared between all projects; the store is
+  content-addressed, so this is safe and dedupes). Your host's own pnpm store is
+  never mounted and isn't writable by the agent, and a project's `node_modules`
+  may even record that stale host path — so if `pnpm add`/`pnpm install` ever
+  complains about the store, a plain **`pnpm install`** (or
+  `rm -rf node_modules && pnpm install`) relinks cleanly into this writable store.
+  That reinstall is deterministic from the lockfile — it is the normal fix, not a
+  workaround.
 - **Login markers** (`hasCompletedOnboarding`, `oauthAccount`, `userID`, …) —
   grafted from the host's `~/.claude.json` into the sandbox's own `.claude.json`
   at startup, so interactive Claude recognizes the seeded credentials and skips

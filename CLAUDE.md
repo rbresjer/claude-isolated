@@ -23,8 +23,9 @@ running the sandbox and watching `docker logs` for squid allow/deny lines.
 # Build (after editing anything baked into the image; run from the repo root)
 docker build -t claude-sandbox:latest .
 
-# Bump the pinned Claude Code version
+# Bump a pinned version (Claude Code, pnpm, or the Postgres major)
 docker build -t claude-sandbox:latest --build-arg CLAUDE_CODE_VERSION=X.Y.Z .
+docker build -t claude-sandbox:latest --build-arg PNPM_VERSION=X.Y.Z .
 
 # Run a session (cwd becomes /workspace; args pass through to `claude`)
 cd <project> && claude-isolated [claude args...]
@@ -195,6 +196,17 @@ keys take a top-level array plus per-launch-dir
   traffic is dropped and the proxy is useless.
 - **The `pre-push` main/master block is best-effort only.** The real guarantee is
   server-side GitHub branch protection; a hijacked agent could edit its own copy.
+- **pnpm is a corepack shim — never invoke it from `entrypoint.sh`, and keep it
+  pinned + cached.** `pnpm`/`npx`-style corepack shims re-resolve their version
+  from the npm registry on invocation and, on a cache miss, block on an
+  interactive "about to download" prompt — a *silent* hang inside the entrypoint
+  (output is redirected) and a real hang for the agent if the registry isn't
+  reachable. Three things keep it from biting: `PNPM_VERSION` pins a concrete
+  version (no `latest` re-resolution); `COREPACK_HOME=/opt/corepack` (world-readable,
+  `chmod a+rX`) puts the build-time cache where the agent uid can read it, not in
+  root's home; and `COREPACK_ENABLE_DOWNLOAD_PROMPT=0` makes a stray cache miss
+  fail fast instead of hanging. To redirect pnpm's store, write `store-dir=` to the
+  agent's `~/.npmrc` directly — do **not** shell out to `pnpm config set`.
 
 ## Secrets
 

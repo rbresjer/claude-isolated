@@ -12,6 +12,11 @@ ARG CLAUDE_CODE_VERSION=2.1.161
 # Pin the Postgres major version baked in for project databases (opt-in at runtime).
 ARG POSTGRES_VERSION=16
 
+# Pin pnpm. A concrete version (not the `latest` tag) stops corepack from
+# re-resolving it against the npm registry on every invocation — that network
+# round-trip plus corepack's download prompt is what hangs an offline/non-allowlisted agent.
+ARG PNPM_VERSION=11.5.1
+
 ENV DEBIAN_FRONTEND=noninteractive
 
 # --- OS packages -------------------------------------------------------------
@@ -59,7 +64,18 @@ RUN install -d /usr/share/postgresql-common/pgdg \
     && rm -rf /var/lib/apt/lists/*
 
 # --- pnpm via corepack -------------------------------------------------------
-RUN corepack enable && corepack prepare pnpm@latest --activate
+# COREPACK_HOME holds the prepared package-manager cache. The default
+# (~/.cache/node/corepack) lands in *root's* home at build time, which the
+# non-root agent (uid 1000) cannot read — so the agent's first `pnpm` would miss
+# the cache and try to re-download, blocking on corepack's interactive prompt.
+# Put the cache in a world-readable shared path instead, and disable the prompt
+# so a cache miss can never silently hang. Both ENVs persist into the runtime,
+# so the agent reads the same prepared cache and needs no network for pnpm.
+ENV COREPACK_HOME=/opt/corepack \
+    COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+RUN corepack enable \
+    && corepack prepare "pnpm@${PNPM_VERSION}" --activate \
+    && chmod -R a+rX /opt/corepack
 
 # --- Claude Code -------------------------------------------------------------
 RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
