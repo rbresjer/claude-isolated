@@ -113,9 +113,11 @@ appends a stray `}` and corrupts the JSON — pass a pre-validated var instead.)
 
 ## Project databases (opt-in)
 
-A project can request a sandbox-managed database via a gitignored
-`/workspace/.claude-isolated.json` (`{"database":{"type":"postgres",...}}`). Three
-pieces interlock:
+A project gets a sandbox-managed database either by **auto-detection** (the
+default: a *local* `DATABASE_URL` in the project's env / `.env*` triggers a
+matching Postgres with no config) or by an **explicit** gitignored
+`/workspace/.claude-isolated.json` (`{"database":{"type":"postgres",...}}`, which
+overrides detection; `"database": false` disables it). Three pieces interlock:
 
 - **Dockerfile** bakes PostgreSQL (server + client) in **dormant** — the
   `POSTGRES_VERSION` build-arg pins the major; the package's default privileged
@@ -123,15 +125,19 @@ pieces interlock:
 - **`claude-isolated`** exports `SANDBOX_PROJECT_KEY` (a sha256-derived,
   collision-resistant id for `$PWD`) — the container only sees `/workspace`, so
   the host must supply the key used to namespace persistent data under `/state`.
-- **`entrypoint.sh`** phase 2 (`setup_database`) parses the config and, for
-  `type=postgres`, inits/starts a **loopback-only** cluster under
+- **`entrypoint.sh`** phase 2 (`setup_database`) resolves the connection params —
+  from the explicit config object, else from `autodetect_postgres` (which parses
+  a *local* `DATABASE_URL` with shell word-splitting + percent-decoding, and bails
+  on a remote host so it never tries to provision someone else's server) — then
+  `start_postgres` inits/starts a **loopback-only** cluster under
   `/state/pg/<key>/<major>` as the agent uid, creating the role+db. It is
   **best-effort, never fail-closed**: a DB that won't start warns and continues
   (the fail-closed gates are for *security*, not features). Because it binds
   `127.0.0.1` and loopback egress is always allowed, it touches none of the
-  iptables/squid posture. Adding another engine (e.g. MySQL) is a new `case`
-  branch in `setup_database` plus its server package in the Dockerfile — the
-  config contract doesn't change.
+  iptables/squid posture. The user/name still pass the conservative SQL-identifier
+  regex in `start_postgres` (a hyphenated role from a URL is skipped with a
+  warning). Adding another engine (e.g. MySQL) is a new `case` branch plus its
+  server package in the Dockerfile — the config contract doesn't change.
 
 ## Host-side config: egress allowlist + read-only auxiliary mounts
 

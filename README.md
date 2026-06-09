@@ -257,8 +257,18 @@ would break the isolation model — but a database server is just a process on a
 port, and **loopback traffic inside the container is unrestricted**, so a
 sandbox-managed database needs no change to the egress firewall.
 
-The image ships PostgreSQL 16 **dormant**. A project opts in with a gitignored
-`/workspace/.claude-isolated.json`:
+The image ships PostgreSQL 16 **dormant**. The common case needs **zero config**:
+if the project's `DATABASE_URL` points at a **local** Postgres (`localhost` /
+`127.0.0.1`), the entrypoint auto-detects it on launch and brings up a cluster
+whose role/database/password/port **match the URL**, so migrations connect
+straight away. The URL is read from the process env, then `.env`, `.env.local`,
+and `.env.development` (what Prisma & friends read). A URL pointing at a *remote*
+host is left untouched — that's someone else's server, not ours to start.
+
+For full control (or a non-default engine selector) a project can still opt in
+explicitly with a gitignored `/workspace/.claude-isolated.json`, which takes
+precedence over auto-detection. Set `"database": false` to **opt out** of
+auto-detection entirely:
 
 ```json
 {
@@ -277,7 +287,8 @@ creating the role and database, so your app's `DATABASE_URL=postgresql://myapp:m
 just works. Reach it from inside the sandbox with `psql -h localhost -p 5432`
 (not `docker exec`).
 
-**Fields** (all optional; a `database` object must be present to trigger anything):
+**Fields** (all optional; an explicit `database` object overrides auto-detection,
+`"database": false` disables it):
 
 | Key        | Default              | Notes                                          |
 |------------|----------------------|------------------------------------------------|
@@ -302,13 +313,15 @@ against `localhost`.
 **Gitignore the config file.** Add `.claude-isolated.json` to the project's
 `.gitignore` — it carries local credentials and is sandbox-specific.
 
-**Per-project recipe.** To tell a future agent session how to use this in a given
-project, drop a note in *that project's* `CLAUDE.md`, e.g.:
+**Per-project recipe.** With a local `DATABASE_URL` in the project's `.env`, no
+config file is needed — the cluster is auto-provisioned to match. If you want to
+spell it out for a future agent session, drop a note in *that project's*
+`CLAUDE.md`, e.g.:
 
-> This project uses a sandbox-managed Postgres. Create `.claude-isolated.json`
-> with `{"database":{"type":"postgres","name":"<db>","user":"<user>","password":"<pw>","port":<port>}}`
-> matching `DATABASE_URL`, then run the project's migrate + seed scripts. Reach
-> the DB with `psql -h localhost`.
+> This project uses a sandbox-managed Postgres, auto-started from `DATABASE_URL`.
+> On launch, run the project's migrate + seed scripts, then reach the DB with
+> `psql -h localhost`. (To override the auto-detected settings, add
+> `.claude-isolated.json` with a `{"database":{...}}` block.)
 
 ## Read-only auxiliary mounts
 

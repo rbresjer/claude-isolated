@@ -239,23 +239,23 @@ if [ -n "${GH_TOKEN:-}" ]; then
         || echo "[entrypoint] WARNING: 'gh auth setup-git' failed; pushes may prompt" >&2
 fi
 
-# --- Optional project database (opt-in via /workspace/.claude-isolated.json) --
+# --- Optional project database (opt-in via config OR DATABASE_URL auto-detect) -
 # Generic, engine-neutral contract: a "database" object with a "type" selects an
-# engine (only "postgres" implemented). The server is baked into the image but
-# dormant; we start it here only on request. BEST-EFFORT, never fail-closed — a
+# engine (only "postgres" implemented). With no such object we AUTO-DETECT — if
+# the project's DATABASE_URL names a LOCAL postgres, we bring up a matching
+# cluster with zero config (an explicit `"database": false` opts out). The server
+# is baked into the image but dormant; we start it here only on request or
+# detection. BEST-EFFORT, never fail-closed — a
 # database that won't start is a feature failure (warn loudly, keep going), not a
 # security breach. Bound to 127.0.0.1, run as the agent uid, data persisted under
 # /state keyed per project; none of this touches the egress posture.
 
 start_postgres() {
-    local cfg="$1" user name password port
-    user="$(jq -r '.database.user // "postgres"' "$cfg")"
-    name="$(jq -r --arg u "$user" '.database.name // $u' "$cfg")"
-    password="$(jq -r '.database.password // "postgres"' "$cfg")"
-    port="$(jq -r '.database.port // 5432' "$cfg")"
+    local user="$1" name="$2" password="$3" port="$4"
 
-    # The workspace config is attacker-controllable in this model (the agent can
-    # write it), and user/name are interpolated into SQL as role/database names.
+    # These values are attacker-controllable in this model — they come from the
+    # agent-writable workspace config OR an auto-detected DATABASE_URL — and
+    # user/name are interpolated into SQL as role/database names.
     # Constrain them to plain SQL identifiers and reject anything else — best-
     # effort, so a bad value warns and skips rather than aborting phase 2. (The
     # password is NOT interpolated; it's passed via a psql variable below, which
@@ -321,17 +321,103 @@ start_postgres() {
     fi
 }
 
+# Percent-decode a URL component ("%40" -> "@", "%2F" -> "/", ...). Best-effort:
+# turns each "%XX" into the byte printf understands as "\xXX". Used only on the
+# user/password/dbname pulled out of a DATABASE_URL.
+urldecode() { printf '%b' "${1//%/\\x}"; }
+
+# Auto-detect a *local* Postgres the project expects, from its DATABASE_URL, and
+# echo a {user,password,name,port} JSON object. Echoes nothing (and the caller
+# skips) when there is no DATABASE_URL, it isn't a postgres URL, or it points at
+# a REMOTE host — a remote database is someone else's server, not ours to start.
+# Source order: the process env, then the dotenv files Prisma & friends read.
+autodetect_postgres() {
+    local url="${DATABASE_URL:-}"
+    if [ -z "$url" ]; then
+        local f line
+        for f in /workspace/.env /workspace/.env.local /workspace/.env.development; do
+            [ -f "$f" ] || continue
+            line="$(grep -aE '^[[:space:]]*(export[[:space:]]+)?DATABASE_URL=' "$f" 2>/dev/null | tail -1)" || true
+            [ -n "$line" ] || continue
+            url="${line#*=}"
+            url="${url%$'\r'}"                 # strip a trailing CR (CRLF files)
+            url="${url#\"}"; url="${url%\"}"    # strip surrounding double quotes
+            url="${url#\'}"; url="${url%\'}"    # ...or single quotes
+            [ -n "$url" ] && break
+        done
+    fi
+    [ -n "$url" ] || return 0
+    case "$url" in postgres://*|postgresql://*) ;; *) return 0 ;; esac
+
+    # Parse  scheme://[user[:password]@]host[:port][/dbname][?params]  with shell
+    # word-splitting (no external URL parser in the image).
+    local rest authority path userinfo hostport host port user password dbname
+    rest="${url#*://}"
+    authority="${rest%%/*}"
+    path="${rest#*/}"; [ "$path" = "$rest" ] && path=""   # no '/' => no db component
+    dbname="${path%%\?*}"
+    if [[ "$authority" == *"@"* ]]; then
+        userinfo="${authority%@*}"; hostport="${authority##*@}"
+    else
+        userinfo=""; hostport="$authority"
+    fi
+    user="${userinfo%%:*}"
+    if [[ "$userinfo" == *":"* ]]; then password="${userinfo#*:}"; else password=""; fi
+    host="${hostport%%:*}"
+    if [[ "$hostport" == *":"* ]]; then port="${hostport##*:}"; else port="5432"; fi
+
+    case "$host" in localhost|127.0.0.1|::1|"") ;; *) return 0 ;; esac   # local only
+
+    user="$(urldecode "$user")"
+    password="$(urldecode "$password")"
+    dbname="$(urldecode "$dbname")"
+
+    # Fill the same defaults the explicit-config path uses.
+    [ -n "$user" ] || user="postgres"
+    [ -n "$dbname" ] || dbname="$user"
+    case "$port" in ''|*[!0-9]*) port="5432" ;; esac
+
+    jq -nc --arg u "$user" --arg p "$password" --arg n "$dbname" --argjson port "$port" \
+        '{user:$u,password:$p,name:$n,port:$port}'
+}
+
 setup_database() {
     local cfg=/workspace/.claude-isolated.json
-    [ -f "$cfg" ] || return 0
     command -v jq >/dev/null 2>&1 || return 0
-    # Require a "database" object; absent or false => nothing to do.
-    [ "$(jq -r 'try ((.database | type) == "object") catch false' "$cfg" 2>/dev/null)" = "true" ] || return 0
 
-    local dbtype
-    dbtype="$(jq -r '.database.type // "postgres"' "$cfg" 2>/dev/null)"
+    # Decide the mode: an explicit `database` object in the workspace config wins;
+    # an explicit `"database": false` is an opt-out; anything else (including no
+    # config file at all) falls through to auto-detection from DATABASE_URL.
+    local mode=auto
+    if [ -f "$cfg" ]; then
+        mode="$(jq -r '
+            if (has("database") and .database == false) then "off"
+            elif (.database | type) == "object" then "explicit"
+            else "auto" end' "$cfg" 2>/dev/null || echo auto)"
+    fi
+    [ "$mode" = "off" ] && return 0
+
+    local dbtype user name password port
+    if [ "$mode" = "explicit" ]; then
+        dbtype="$(jq -r '.database.type // "postgres"' "$cfg")"
+        user="$(jq -r '.database.user // "postgres"' "$cfg")"
+        name="$(jq -r --arg u "$user" '.database.name // $u' "$cfg")"
+        password="$(jq -r '.database.password // "postgres"' "$cfg")"
+        port="$(jq -r '.database.port // 5432' "$cfg")"
+    else
+        local detected
+        detected="$(autodetect_postgres)" || return 0
+        [ -n "$detected" ] || return 0
+        dbtype=postgres
+        user="$(printf '%s' "$detected" | jq -r '.user')"
+        name="$(printf '%s' "$detected" | jq -r '.name')"
+        password="$(printf '%s' "$detected" | jq -r '.password')"
+        port="$(printf '%s' "$detected" | jq -r '.port')"
+        echo "[entrypoint] auto-detected local Postgres from DATABASE_URL (database '$name', user '$user', port $port)"
+    fi
+
     case "$dbtype" in
-        postgres) start_postgres "$cfg" ;;
+        postgres) start_postgres "$user" "$name" "$password" "$port" ;;
         *) echo "[entrypoint] WARNING: unsupported database type '$dbtype' in .claude-isolated.json — skipping" >&2 ;;
     esac
 }
@@ -339,10 +425,9 @@ setup_database() {
 # Guarded so a database hiccup can never abort phase 2 (set -e is active).
 setup_database || true
 
-# Default command: a skip-permissions Claude session in the workspace. The
-# proxy + firewall + non-root user are what make that flag safe here.
-if [ "$#" -eq 0 ]; then
-    set -- claude --dangerously-skip-permissions
-fi
-
-exec "$@"
+# A skip-permissions Claude session in the workspace; the proxy + firewall +
+# non-root user are what make that flag safe here. Any args the wrapper forwarded
+# (e.g. --resume <id>) are claude args per the documented contract — append them
+# to claude rather than exec'ing them as a standalone command (a leading "--..."
+# would otherwise be parsed as an option to the `exec` builtin itself).
+exec claude --dangerously-skip-permissions "$@"
