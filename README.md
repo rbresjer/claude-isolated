@@ -134,8 +134,18 @@ Fill it in:
   local/public-only work.
 - **`GIT_AUTHOR_NAME` / `GIT_AUTHOR_EMAIL`** — commit identity (git reads these
   directly when committing).
-- **`CLAUDE_CODE_OAUTH_TOKEN`** *(optional)* — a pre-issued token if you'd rather
-  not rely on the seeded credentials.
+- **`CLAUDE_CODE_OAUTH_TOKEN`** *(recommended)* — a long-lived (one-year, static)
+  token from `claude setup-token`, run once on the host. Without it, sessions fall
+  back to the credentials seeded from your host `~/.claude` — which go stale: the
+  seeded copy is one-way, OAuth access tokens last ~8 h and refreshing **rotates**
+  the refresh token inside the container's throwaway copy, revoking the host's.
+  The visible symptom is any *new* session (host or sandbox) asking you to log in
+  again whenever some sandbox session has run longer than ~8 h. The setup-token
+  has no refresh flow, so any number of concurrent containers can share it without
+  invalidating each other or your host login. It authenticates against your Claude
+  **subscription** (Pro/Max/Team/Enterprise), not pay-per-token API billing — just
+  don't also set `ANTHROPIC_API_KEY` here, which would take precedence *and* bill
+  per token.
 
 The file is the container's `--env-file`, so any `VAR=value` line is passed in.
 
@@ -259,6 +269,12 @@ Your real `~/.claude` is mounted **read-only** (as `/seed`) and only ever copied
   the "how do you want to log in?" onboarding screen. Only these few keys are
   copied — **not** the host's full `.claude.json` (which is large and holds your
   host project history). A host re-login propagates on the next sandbox run.
+- **Seeded credentials go stale by design** — the copy is one-way (the seed is
+  read-only), so when a session outlives the ~8 h OAuth access token, Claude
+  refreshes it *inside the throwaway copy*; the rotation revokes the host's
+  refresh token and the next new session prompts for login. Set
+  `CLAUDE_CODE_OAUTH_TOKEN` in the env file to opt out of seeded credentials
+  entirely (see [Configure (env file)](#3-configure-env-file)).
 
 What does **not** persist: changes to global config (settings / hooks /
 `CLAUDE.md` / plugins) — by design, since those are the host-escape vectors.
@@ -418,6 +434,7 @@ starve the host. The default leaves headroom for several concurrent sessions on 
 | `created env template … then re-run` | Expected on first run — fill in `~/.config/claude-isolated/env` |
 | A needed download/host fails | Not allowlisted. Add it to `domains` in `~/.config/claude-isolated/config.json` and re-run (no rebuild). Check `docker logs` for the squid deny line. |
 | Container exits immediately, squid `FATAL` about a `dstdomain` | Overlapping allowlist entries (a domain and its subdomain). Collapse to one `.domain`. |
+| New session (host or sandbox) asks to log in again | A sandbox session ran >8 h and rotated the OAuth token in its throwaway copy, revoking the host's. Set `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`) in the env file — see [Configure (env file)](#3-configure-env-file). |
 | Playwright can't reach an external (allowlisted) site | Pass `proxy: { server: 'http://127.0.0.1:3128' }` to `chromium.launch()` |
 | terraform MCP logs an error | Expected — it's a docker-image MCP and there's no docker socket in the box. Claude continues. |
 | Push to `main` rejected | Working as intended (`pre-push` guard). Push a `feat/*` branch and open a PR. |
